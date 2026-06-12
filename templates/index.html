@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Evidence Tool</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Evidence Tool</h1>
+    <p class="muted">Local inventory, duplicate detection, CSV export, and Ollama-assisted categorization.</p>
+  </header>
+
+  <section class="panel warning">
+    <strong>Local evidence handling note:</strong> folder/path scanning reads files from the machine running this Flask app. Ollama categorization sends extracted text and metadata to the configured <code>OLLAMA_ENDPOINTS</code>. Keep the endpoint local or trusted.
+  </section>
+
+  <main class="grid">
+    <section class="panel">
+      <h2>Phase 1 — Scan folders or files</h2>
+      <form id="scan-form" method="post" action="{{ url_for('start_scan') }}">
+        <label>Scan label</label>
+        <input name="label" placeholder="e.g., PFL evidence master folder">
+
+        <label>Folder/file paths, one per line</label>
+        <textarea name="paths" rows="7" placeholder="C:\Users\Jeff\Documents\Folder1&#10;D:\Evidence\case-file.pdf"></textarea>
+        <p class="hint">Use absolute paths for folders or individual files. Directories are scanned recursively. Directory symlinks are not followed.</p>
+
+        <button type="submit">Start scan</button>
+      </form>
+
+      <hr>
+
+      <details>
+        <summary>Optional: upload selected files/folders into this local app, then scan</summary>
+        <form id="upload-form" method="post" action="{{ url_for('upload_and_scan') }}" enctype="multipart/form-data">
+          <label>Upload scan label</label>
+          <input name="upload_label" placeholder="Uploaded evidence batch">
+          <label>Individual files</label>
+          <input type="file" name="evidence_files" multiple>
+          <label>Folder upload</label>
+          <input type="file" name="evidence_folder_files" multiple webkitdirectory directory>
+          <p class="hint">Browsers do not expose original absolute folder paths for uploads; files are copied into <code>uploads/</code> first.</p>
+          <button type="submit">Upload and scan</button>
+        </form>
+      </details>
+    </section>
+
+    <section class="panel">
+      <h2>Phase 2 — Categorize unique files with Ollama</h2>
+      {% if scan %}
+      <form id="ai-form" method="post" action="{{ url_for('start_ai') }}">
+        <input type="hidden" name="scan_id" value="{{ scan.id }}">
+        <label>Ollama model</label>
+        <input name="model" value="{{ default_model }}" placeholder="e.g., llama3.1:8b, qwen2.5:14b">
+
+        <label>Categories to use</label>
+        <textarea name="categories" rows="5" placeholder="Key correspondence&#10;Meeting materials&#10;Funding / grants&#10;Legal / policy documents&#10;Media / public communications&#10;Other / Unclear"></textarea>
+
+        <label>Investigation / project context</label>
+        <textarea name="context" rows="5" placeholder="Describe the case, project, organizations, people, time period, and what you want the model to pay attention to. The app tells the model to use this as background, not as a generic description of every file."></textarea>
+
+        <div class="row two">
+          <div>
+            <label>Max extracted chars per file</label>
+            <input name="max_chars" type="number" value="{{ default_max_chars }}" min="1000" step="1000">
+          </div>
+          <div>
+            <label>Max unique files this run</label>
+            <input name="max_files" type="number" min="1" placeholder="blank = all remaining">
+          </div>
+        </div>
+
+        <label class="checkbox"><input type="checkbox" name="force"> Re-run files already categorized</label>
+        <button type="submit">Categorize unique files</button>
+      </form>
+      {% else %}
+      <p class="muted">Run a scan first, then this section will submit one representative copy of each unique hash to Ollama.</p>
+      {% endif %}
+    </section>
+  </main>
+
+  <section id="job-panel" class="panel job hidden">
+    <div class="toolbar wrap">
+      <h2>Job status</h2>
+      <button id="job-cancel" class="danger hidden" type="button">Cancel categorization job</button>
+    </div>
+    <div class="progress"><div id="job-bar"></div></div>
+    <p id="job-message">Queued...</p>
+    <pre id="job-errors"></pre>
+  </section>
+
+  <section class="panel">
+    <div class="toolbar">
+      <h2>Scans</h2>
+      <form method="post" action="{{ url_for('clear_uploads') }}" onsubmit="return confirm('Remove uploaded staging files under uploads/? This will not delete original path-scanned evidence.');">
+        <button class="secondary" type="submit">Clear staged uploads</button>
+      </form>
+    </div>
+    {% if scans %}
+    <table class="compact">
+      <thead><tr><th>ID</th><th>Label</th><th>Status</th><th>Files</th><th>Unique</th><th>Duplicates</th><th>Errors</th><th>Started</th><th></th></tr></thead>
+      <tbody>
+      {% for s in scans %}
+        <tr class="{% if scan and s.id == scan.id %}selected{% endif %}">
+          <td>{{ s.id }}</td>
+          <td><a href="{{ url_for('home', scan_id=s.id) }}">{{ s.label }}</a></td>
+          <td>{{ s.status }}</td>
+          <td>{{ s.file_count }}</td>
+          <td>{{ s.unique_count }}</td>
+          <td>{{ s.duplicate_count }}</td>
+          <td>{{ s.error_count }}</td>
+          <td>{{ s.started_at }}</td>
+          <td>
+            <form method="post" action="{{ url_for('delete_scan', scan_id=s.id) }}" onsubmit="return confirm('Delete this scan from the local database? Original files are not deleted.');">
+              <button class="danger tiny" type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">No scans yet.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>Categorization jobs</h2>
+    <p class="muted">Ollama categorization runs one job at a time. New requests are queued until the current job finishes or is cancelled.</p>
+    {% if ai_jobs %}
+    <table class="compact">
+      <thead>
+        <tr>
+          <th>ID</th><th>Scan</th><th>Status</th><th>Progress</th><th>Model</th><th>Errors</th><th>Created</th><th>Started</th><th>Finished</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for j in ai_jobs %}
+        <tr>
+          <td>{{ j.id }}</td>
+          <td>{% if j.scan_label %}<a href="{{ url_for('home', scan_id=j.scan_id) }}">{{ j.scan_label }}</a>{% else %}Scan {{ j.scan_id }}{% endif %}</td>
+          <td>{{ j.status }}</td>
+          <td>{{ j.current }} / {{ j.total }}</td>
+          <td>{{ j.model or '' }}</td>
+          <td title="{{ j.last_error or '' }}">{{ j.error_count }}</td>
+          <td>{{ j.created_at }}</td>
+          <td>{{ j.started_at or '' }}</td>
+          <td>{{ j.finished_at or '' }}</td>
+          <td>
+            {% if j.status not in ai_terminal_statuses %}
+            <form method="post" action="{{ url_for('cancel_ai_job', ai_job_id=j.id) }}" onsubmit="return confirm('Cancel this categorization job? If Ollama is currently processing a file, the job will stop after that request returns.');">
+              <button class="danger tiny" type="submit">Cancel</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">No categorization jobs yet.</p>
+    {% endif %}
+  </section>
+
+  {% if scan %}
+  <section class="panel">
+    <div class="toolbar wrap">
+      <div>
+        <h2>Current scan: {{ scan.label }}</h2>
+        <p class="muted">Hash algorithm: {{ hash_algo }}. Preview shows first 1,000 rows; CSV exports include the full scan. AI columns are always shown.</p>
+      </div>
+      <div class="actions">
+        <a class="button" href="{{ url_for('export_scan', scan_id=scan.id) }}">Export inventory CSV</a>
+        <a class="button" href="{{ url_for('export_scan_ai', scan_id=scan.id) }}">Export inventory + AI CSV</a>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div><strong>{{ scan.file_count }}</strong><span>files</span></div>
+      <div><strong>{{ scan.unique_count }}</strong><span>unique hashes</span></div>
+      <div><strong>{{ scan.duplicate_count }}</strong><span>duplicate copies</span></div>
+      <div><strong>{{ scan.error_count }}</strong><span>scan errors</span></div>
+    </div>
+
+    {% if ai_counts %}
+      <h3>Ollama status by unique hash</h3>
+      <ul class="chips">
+        {% for c in ai_counts %}<li>{{ c.status }}: {{ c.n }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+
+    {% if duplicate_groups %}
+      <details>
+        <summary>Duplicate hash groups (top {{ duplicate_groups|length }})</summary>
+        <table class="compact">
+          <thead><tr><th>Copies</th><th>Example file</th><th>Hash</th></tr></thead>
+          <tbody>
+          {% for d in duplicate_groups %}
+            <tr><td>{{ d.copies }}</td><td>{{ d.example_name }}</td><td class="hash">{{ d.file_hash }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </details>
+    {% endif %}
+
+    {% if errors %}
+      <details>
+        <summary>Recent scan errors</summary>
+        <table class="compact">
+          <thead><tr><th>Path</th><th>Error</th><th>Time</th></tr></thead>
+          <tbody>
+          {% for e in errors %}
+            <tr><td>{{ e.path }}</td><td>{{ e.error }}</td><td>{{ e.created_at }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </details>
+    {% endif %}
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>File name</th>
+            <th>Type of file</th>
+            <th>Folder location</th>
+            <th>Last modified date</th>
+            <th>Creation date</th>
+            <th>Size (MB)</th>
+            <th>Hash</th>
+            <th>AI category</th>
+            <th>AI description</th>
+            <th>AI status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for f in files %}
+          <tr>
+            <td title="{{ f.full_path }}">{{ f.file_name }}</td>
+            <td>{{ f.file_type }}</td>
+            <td>{{ f.folder_location }}</td>
+            <td>{{ f.last_modified_date }}</td>
+            <td>{{ f.creation_date }}</td>
+            <td>{{ "%.1f"|format(f.size_mb or 0) }}</td>
+            <td class="hash">{{ f.file_hash }}</td>
+            <td>{{ f.ai_category or '' }}</td>
+            <td class="description">{{ f.ai_description or '' }}</td>
+            <td>{{ f.ai_status or 'not_started' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% endif %}
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
