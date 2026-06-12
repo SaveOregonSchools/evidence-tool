@@ -49,6 +49,18 @@ AI_EXPORT_HEADERS = CORE_EXPORT_HEADERS + [
     "AI status",
 ]
 
+AI_ERROR_EXPORT_HEADERS = [
+    "Error ID",
+    "AI job ID",
+    "Scan ID",
+    "Created at",
+    "File name",
+    "File path",
+    "Hash",
+    "Stage",
+    "Error",
+]
+
 
 def get_db() -> sqlite3.Connection:
     """Return a SQLite connection with rows accessible by column name."""
@@ -149,6 +161,23 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ai_jobs_scan ON ai_jobs(scan_id);
             CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status, id);
 
+            CREATE TABLE IF NOT EXISTS ai_errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ai_job_id INTEGER NOT NULL,
+                scan_id INTEGER NOT NULL,
+                file_hash TEXT,
+                file_name TEXT,
+                source_file_path TEXT,
+                error TEXT NOT NULL,
+                stage TEXT,
+                created_at TEXT,
+                FOREIGN KEY(ai_job_id) REFERENCES ai_jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ai_errors_job ON ai_errors(ai_job_id, id);
+            CREATE INDEX IF NOT EXISTS idx_ai_errors_scan ON ai_errors(scan_id, id);
+
             CREATE TABLE IF NOT EXISTS scan_errors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scan_id INTEGER NOT NULL,
@@ -163,6 +192,9 @@ def init_db() -> None:
         _ensure_column(conn, "ai_results", "raw_response", "raw_response TEXT")
         _ensure_column(conn, "ai_results", "model", "model TEXT")
         _ensure_column(conn, "ai_results", "extraction_status", "extraction_status TEXT")
+        _ensure_column(conn, "ai_errors", "file_name", "file_name TEXT")
+        _ensure_column(conn, "ai_errors", "source_file_path", "source_file_path TEXT")
+        _ensure_column(conn, "ai_errors", "stage", "stage TEXT")
         conn.commit()
 
 

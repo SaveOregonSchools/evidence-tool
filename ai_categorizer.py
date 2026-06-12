@@ -6,14 +6,33 @@ import re
 from pathlib import Path
 from typing import Any
 
-from common import EXTRACT_MAX_CHARS
-from ollama_client import chat
+from common import EXTRACT_MAX_CHARS, OLLAMA_NUM_PREDICT
+from ollama_client import OllamaEmptyResponseError, chat
 from text_extract import extract_text
+
+PATCH_ID = "2026-06-12-ollama-thinking-v3"
+
+
+CATEGORIZATION_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "category": {
+            "type": "string",
+            "description": "Exactly one concise category label. Prefer one of the supplied categories when categories are supplied.",
+        },
+        "description": {
+            "type": "string",
+            "description": "A 3-4 sentence, evidence-focused summary of the file contents, under 120 words total.",
+        },
+    },
+    "required": ["category", "description"],
+    "additionalProperties": False,
+}
 
 
 def _strip_model_wrappers(text: str) -> str:
     s = (text or "").strip()
-    # Some reasoning models emit hidden-thinking tags even when asked not to.
+    # Some reasoning models emit thinking tags in content even when asked not to.
     s = re.sub(r"<think>.*?</think>", "", s, flags=re.IGNORECASE | re.DOTALL).strip()
     if s.startswith("```"):
         lines = s.splitlines()
@@ -92,6 +111,15 @@ def _regex_field(text: str, field: str) -> str:
     match = re.search(rf"^{re.escape(field)}\s*[:=-]\s*(?P<value>.+)$", text, flags=re.IGNORECASE | re.MULTILINE)
     if match:
         return match.group("value").strip().strip('"')
+
+    # Some models write phrases such as "category tag:" or "description label:".
+    match = re.search(
+        rf"^{re.escape(field)}\s+(?:tag|label|field)\s*[:=-]\s*(?P<value>.+)$",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if match:
+        return match.group("value").strip().strip('"')
     return ""
 
 
@@ -101,14 +129,28 @@ def _parse_response(text: str) -> dict[str, str]:
     try:
         data = json.loads(cleaned)
         if isinstance(data, dict):
-            category = str(data.get("category") or "Uncategorized").strip()
-            description = str(data.get("description") or "").strip()
+            category = str(data.get("category") or data.get("category_tag") or data.get("category_label") or "Uncategorized").strip()
+            description = str(data.get("description") or data.get("description_tag") or data.get("description_label") or "").strip()
             return {"category": category or "Uncategorized", "description": description, "status": "ok"}
     except json.JSONDecodeError:
         pass
 
-    category = _regex_field(raw, "category") or _regex_field(cleaned, "category")
-    description = _regex_field(raw, "description") or _regex_field(cleaned, "description")
+    category = (
+        _regex_field(raw, "category")
+        or _regex_field(raw, "category_tag")
+        or _regex_field(raw, "category_label")
+        or _regex_field(cleaned, "category")
+        or _regex_field(cleaned, "category_tag")
+        or _regex_field(cleaned, "category_label")
+    )
+    description = (
+        _regex_field(raw, "description")
+        or _regex_field(raw, "description_tag")
+        or _regex_field(raw, "description_label")
+        or _regex_field(cleaned, "description")
+        or _regex_field(cleaned, "description_tag")
+        or _regex_field(cleaned, "description_label")
+    )
     if category or description:
         return {
             "category": category or "Uncategorized",
@@ -129,7 +171,8 @@ def _categories_block(categories: str) -> str:
         return "No fixed category list was supplied. Create one concise, useful category label."
     return (
         "Choose exactly one category from this list. Use 'Other / Unclear' only if none of the listed "
-        "categories fit the file's actual content:\n" + "\n".join(f"- {item}" for item in items)
+        "categories fit the file's actual content. Do not invent a new category when one of these fits:\n"
+        + "\n".join(f"- {item}" for item in items)
     )
 
 
@@ -141,19 +184,25 @@ def build_messages(
     extraction_error: str,
     categories: str,
     context: str,
+    extra_no_think_instruction: bool = False,
 ) -> list[dict[str, str]]:
-    system = """
-You are a careful investigative evidence librarian. Your task is to triage one file for an investigator.
+    no_think_header = "/no_think\n" if extra_no_think_instruction else ""
+    system = f"""
+{no_think_header}You are a careful investigative evidence librarian. Your task is to triage one file for an investigator.
 
 Rules:
 - Use the project context only as background for disambiguating terms. Do not repeat the context as if it were evidence from this file.
 - Focus on what the file itself appears to contain: document type, subject matter, named organizations or people, dates, decisions, agenda items, requests, evidence value, or notable contents.
-- Do not write generic descriptions such as "This is from the Partnership for the Future of Learning" unless the extracted text or metadata specifically supports that as a meaningful description of the file.
-- If extracted text is unavailable, say the description is based on metadata only, and make the best careful inference from filename, type, folder, dates, and size.
+- Do not write generic descriptions such as "This is from the Partnership for the Future of Learning" or "This file is associated with PFL" unless the extracted text, file name, or metadata specifically supports that as a meaningful description of the file.
+- Prefer descriptions that start with the artifact type and contents, such as "A memo...", "A slide deck...", "A participant list...", "Meeting notes...", or "An image file...".
+- If extracted text is unavailable, explicitly say that text extraction was unavailable or failed, then make the best careful inference from filename, type, folder, dates, and size.
+- If the file appears unrelated to the project context, say that briefly and still summarize what the file appears to contain.
 - Do not invent people, organizations, dates, claims, or legal significance that are not supported by the provided material.
 - Do not make legal conclusions.
-- Return compact valid JSON only. No markdown, no code fence, no XML tags, no chain-of-thought, no introductory prose.
-- JSON schema: {"category": "one category string", "description": "3-4 concise evidence-focused sentences, under 120 words total"}
+- Final answer only: no reasoning trace, no chain-of-thought, no hidden reasoning, no markdown, no code fence, no XML tags, no introductory prose.
+- Return compact valid JSON only.
+- Begin the answer with {{ and end it with }}.
+- JSON schema: {{"category": "one category string", "description": "3-4 concise evidence-focused sentences, under 120 words total"}}
 """.strip()
     user = f"""
 Investigation / project context, for background only:
@@ -170,8 +219,45 @@ Extraction error, if any: {extraction_error or '[none]'}
 
 Extracted text, capped for local model context:
 {extracted_text or '[No extracted text available; use metadata only.]'}
+
+Return the JSON object only now. /no_think
 """.strip()
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _chat_with_fallbacks(messages: list[dict[str, str]], *, model: str | None) -> str:
+    """Try structured output first, then simpler prompts if a thinking model returns empty content."""
+    attempts: list[tuple[str, str | dict[str, Any] | None, int]] = [
+        ("json_schema", CATEGORIZATION_JSON_SCHEMA, OLLAMA_NUM_PREDICT),
+        ("json_mode", "json", OLLAMA_NUM_PREDICT),
+        ("plain_json", None, max(OLLAMA_NUM_PREDICT, 4096)),
+    ]
+    errors: list[str] = []
+    for label, response_format, num_predict in attempts:
+        try:
+            return chat(
+                messages,
+                model=model,
+                temperature=0.0,
+                response_format=response_format,
+                num_predict=num_predict,
+                think=False,
+            )
+        except OllamaEmptyResponseError as e:
+            errors.append(f"{label}: {e}")
+            # Continue to simpler response formats; some model/Ollama combinations
+            # behave better without structured-output mode.
+            continue
+        except Exception:
+            # Non-empty-response errors such as connection errors should be surfaced
+            # immediately so the queue can pause/fail instead of doing needless work.
+            raise
+
+    raise OllamaEmptyResponseError(
+        "Ollama returned thinking traces but no final assistant content after schema, json, and plain JSON attempts.\n"
+        + "\n\n".join(errors[-3:]),
+        had_thinking=True,
+    )
 
 
 def categorize_file(
@@ -191,8 +277,10 @@ def categorize_file(
         extraction_error=str(extraction.get("error") or ""),
         categories=categories,
         context=context,
+        extra_no_think_instruction=True,
     )
-    raw = chat(messages, model=model, temperature=0.0, response_format="json")
+
+    raw = _chat_with_fallbacks(messages, model=model)
     parsed = _parse_response(raw)
     parsed["raw_response"] = raw
     parsed["extraction_status"] = extraction.get("status")

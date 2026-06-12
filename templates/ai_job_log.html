@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Evidence Tool — Categorization Error Log</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Categorization Error Log</h1>
+    <p class="muted">Job #{{ job.id }}{% if job.scan_label %} for {{ job.scan_label }}{% endif %}</p>
+  </header>
+
+  <section class="panel">
+    <div class="toolbar wrap">
+      <div>
+        <h2>Job details</h2>
+        <p class="muted">Use the plain-text block below for easy copy/paste into troubleshooting notes or an issue report.</p>
+      </div>
+      <div class="actions">
+        <a class="button secondary" href="{{ url_for('home', scan_id=job.scan_id, ai_job_id=job.id) }}">Back to tool</a>
+        <a class="button" href="{{ url_for('ai_job_errors_text', ai_job_id=job.id) }}">Open plain text</a>
+        <a class="button" href="{{ url_for('export_ai_job_errors', ai_job_id=job.id) }}">Export error CSV</a>
+      </div>
+    </div>
+
+    <table class="details-table compact">
+      <tbody>
+        <tr><th>Job ID</th><td>{{ job.id }}</td></tr>
+        <tr><th>Scan</th><td>{{ job.scan_label or ('Scan ' ~ job.scan_id) }}; ID {{ job.scan_id }}</td></tr>
+        <tr><th>Status</th><td>{{ job.status }}</td></tr>
+        <tr><th>Progress</th><td>{{ job.current }} / {{ job.total }}</td></tr>
+        <tr><th>Model</th><td>{{ job.model or '' }}</td></tr>
+        <tr><th>Created</th><td>{{ job.created_at or '' }}</td></tr>
+        <tr><th>Started</th><td>{{ job.started_at or '' }}</td></tr>
+        <tr><th>Finished</th><td>{{ job.finished_at or '' }}</td></tr>
+        <tr><th>Message</th><td>{{ job.message or '' }}</td></tr>
+        <tr><th>Last error</th><td class="error-cell">{{ job.last_error or '' }}</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>Copyable plain-text log</h2>
+    <div class="copy-row">
+      <button type="button" id="copy-log">Copy log to clipboard</button>
+      <span id="copy-status" class="muted"></span>
+    </div>
+    <pre id="error-log-text" class="log-pre">{{ plain_text }}</pre>
+  </section>
+
+  <section class="panel">
+    <h2>Stored error entries</h2>
+    {% if errors %}
+    <div class="table-wrap tall">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Time</th>
+            <th>Stage</th>
+            <th>File</th>
+            <th>Path</th>
+            <th>Hash</th>
+            <th>Error</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for e in errors %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>{{ e.created_at or '' }}</td>
+            <td>{{ e.stage or '' }}</td>
+            <td>{{ e.file_name or '' }}</td>
+            <td class="path-cell">{{ e.source_file_path or '' }}</td>
+            <td class="hash">{{ e.file_hash or '' }}</td>
+            <td class="error-cell">{{ e.error or '' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+      <p class="muted">No stored error entries were found for this job.</p>
+    {% endif %}
+  </section>
+
+  <script>
+    const copyButton = document.getElementById('copy-log');
+    const copyStatus = document.getElementById('copy-status');
+    copyButton?.addEventListener('click', async () => {
+      const text = document.getElementById('error-log-text')?.innerText || '';
+      try {
+        await navigator.clipboard.writeText(text);
+        copyStatus.textContent = 'Copied.';
+      } catch (e) {
+        copyStatus.textContent = 'Select the text block and copy manually.';
+      }
+    });
+  </script>
+</body>
+</html>

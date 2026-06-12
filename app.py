@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import shutil
+import time
 import threading
 import uuid
 from datetime import datetime
@@ -15,6 +16,7 @@ from werkzeug.utils import secure_filename
 
 from ai_categorizer import categorize_file
 from common import (
+    AI_ERROR_EXPORT_HEADERS,
     AI_EXPORT_HEADERS,
     AI_MAX_CONSECUTIVE_ERRORS,
     CORE_EXPORT_HEADERS,
@@ -26,6 +28,8 @@ from common import (
     init_db,
 )
 from evidence_scanner import parse_paths, scan_files
+
+APP_PATCH_ID = "2026-06-12-ollama-thinking-v3"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20GB; local-only app, override in deployment if needed.
@@ -207,18 +211,53 @@ def latest_scan_id() -> int | None:
         return int(row["id"]) if row else None
 
 
-def fetch_dashboard(scan_id: int | None) -> dict[str, Any]:
+def scan_id_for_ai_job(ai_job_id: int) -> int | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT scan_id FROM ai_jobs WHERE id = ?", (ai_job_id,)).fetchone()
+        return int(row["scan_id"]) if row else None
+
+
+def _fetch_ai_jobs(conn, limit: int = 25) -> list[Any]:
+    return conn.execute(
+        """
+        SELECT j.*, s.label AS scan_label
+        FROM ai_jobs j
+        LEFT JOIN scans s ON s.id = j.scan_id
+        ORDER BY j.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def fetch_dashboard(scan_id: int | None, selected_ai_job_id: int | None = None) -> dict[str, Any]:
     with get_db() as conn:
         scans = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT 15").fetchall()
-        ai_jobs = conn.execute(
-            """
-            SELECT j.*, s.label AS scan_label
-            FROM ai_jobs j
-            LEFT JOIN scans s ON s.id = j.scan_id
-            ORDER BY j.id DESC
-            LIMIT 25
-            """
-        ).fetchall()
+        ai_jobs = _fetch_ai_jobs(conn)
+        selected_ai_job = None
+        selected_ai_job_errors = []
+        if selected_ai_job_id:
+            selected_ai_job = conn.execute(
+                """
+                SELECT j.*, s.label AS scan_label
+                FROM ai_jobs j
+                LEFT JOIN scans s ON s.id = j.scan_id
+                WHERE j.id = ?
+                """,
+                (selected_ai_job_id,),
+            ).fetchone()
+            if selected_ai_job:
+                selected_ai_job_errors = conn.execute(
+                    """
+                    SELECT *
+                    FROM ai_errors
+                    WHERE ai_job_id = ?
+                    ORDER BY id DESC
+                    LIMIT 200
+                    """,
+                    (selected_ai_job_id,),
+                ).fetchall()
+
         scan = None
         files = []
         duplicate_groups = []
@@ -272,6 +311,8 @@ def fetch_dashboard(scan_id: int | None) -> dict[str, Any]:
         return {
             "scans": scans,
             "ai_jobs": ai_jobs,
+            "selected_ai_job": selected_ai_job,
+            "selected_ai_job_errors": selected_ai_job_errors,
             "scan": scan,
             "files": files,
             "duplicate_groups": duplicate_groups,
@@ -284,11 +325,89 @@ def fetch_dashboard(scan_id: int | None) -> dict[str, Any]:
         }
 
 
+
+
+@app.route("/debug/version")
+def debug_version():
+    """Small local diagnostic endpoint to confirm the replacement files are loaded."""
+    import ollama_client
+
+    return jsonify(
+        {
+            "ok": True,
+            "patch_id": APP_PATCH_ID,
+            "app_file": str(Path(__file__).resolve()),
+            "ollama_client_file": str(Path(ollama_client.__file__).resolve()),
+            "ollama_think": getattr(ollama_client, "OLLAMA_THINK", None),
+            "ollama_endpoints": getattr(ollama_client, "NORMALIZED_OLLAMA_ENDPOINTS", []),
+        }
+    )
+
+
+@app.route("/debug/ollama_test")
+def debug_ollama_test():
+    """Run one tiny Ollama call so model/endpoint/thinking problems are easy to isolate."""
+    from ollama_client import chat
+
+    model = (request.args.get("model") or OLLAMA_MODEL or "").strip()
+    if not model:
+        return jsonify({"ok": False, "error": "No model supplied and OLLAMA_MODEL is blank."}), 400
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a diagnostic endpoint. Return compact JSON only. Do not think. Do not explain.",
+        },
+        {
+            "role": "user",
+            "content": 'Return exactly this JSON object and nothing else: {"category":"diagnostic","description":"Ollama API test succeeded."}',
+        },
+    ]
+    started = time.perf_counter()
+    try:
+        raw = chat(
+            messages,
+            model=model,
+            temperature=0.0,
+            num_predict=256,
+            timeout=90,
+            response_format="json",
+            retries=0,
+            think=False,
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "patch_id": APP_PATCH_ID,
+                "model": model,
+                "seconds": round(time.perf_counter() - started, 2),
+                "response": raw,
+            }
+        )
+    except Exception as e:
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "patch_id": APP_PATCH_ID,
+                    "model": model,
+                    "seconds": round(time.perf_counter() - started, 2),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                }
+            ),
+            500,
+        )
+
+
 @app.route("/")
 def home():
     requested = request.args.get("scan_id", type=int)
+    selected_ai_job_id = request.args.get("ai_job_id", type=int)
+    if selected_ai_job_id and not requested:
+        requested = scan_id_for_ai_job(selected_ai_job_id)
     scan_id = requested or latest_scan_id()
-    return render_template("index.html", **fetch_dashboard(scan_id))
+    return render_template("index.html", **fetch_dashboard(scan_id, selected_ai_job_id))
 
 
 @app.route("/start_scan", methods=["POST"])
@@ -398,6 +517,26 @@ def create_ai_job_db(
         return int(cur.lastrowid)
 
 
+def _log_ai_error(
+    conn,
+    *,
+    ai_job_id: int,
+    scan_id: int,
+    file_hash: str | None = None,
+    file_name: str | None = None,
+    source_file_path: str | None = None,
+    error: str,
+    stage: str = "ollama",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO ai_errors(ai_job_id, scan_id, file_hash, file_name, source_file_path, error, stage, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (ai_job_id, scan_id, file_hash or "", file_name or "", source_file_path or "", error, stage, now_str()),
+    )
+
+
 def _ai_cancel_requested(conn, ai_job_id: int) -> bool:
     row = conn.execute("SELECT cancel_requested, status FROM ai_jobs WHERE id = ?", (ai_job_id,)).fetchone()
     if not row:
@@ -430,10 +569,12 @@ def run_ai_job_by_id(ai_job_id: int) -> None:
         scan_id = int(job["scan_id"])
         scan = conn.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
         if not scan:
+            error_text = "Scan not found."
             conn.execute(
-                "UPDATE ai_jobs SET status = 'failed', message = ?, finished_at = ? WHERE id = ?",
-                ("Scan not found.", now_str(), ai_job_id),
+                "UPDATE ai_jobs SET status = 'failed', message = ?, last_error = ?, error_count = error_count + 1, finished_at = ? WHERE id = ?",
+                (error_text, error_text, now_str(), ai_job_id),
             )
+            _log_ai_error(conn, ai_job_id=ai_job_id, scan_id=scan_id, error=error_text, stage="setup")
             conn.commit()
             return
 
@@ -547,6 +688,16 @@ def run_ai_job_by_id(ai_job_id: int) -> None:
                     """,
                     (error_text, now_str(), scan_id, row["file_hash"]),
                 )
+                _log_ai_error(
+                    conn,
+                    ai_job_id=ai_job_id,
+                    scan_id=scan_id,
+                    file_hash=row["file_hash"],
+                    file_name=row["file_name"],
+                    source_file_path=row["full_path"],
+                    error=error_text,
+                    stage="categorize_file",
+                )
                 conn.execute(
                     """
                     UPDATE ai_jobs
@@ -558,19 +709,17 @@ def run_ai_job_by_id(ai_job_id: int) -> None:
                 conn.commit()
 
                 if AI_MAX_CONSECUTIVE_ERRORS > 0 and consecutive_errors >= AI_MAX_CONSECUTIVE_ERRORS:
+                    stop_message = (
+                        f"Stopped after {consecutive_errors} consecutive Ollama errors. "
+                        "Open the error log below, fix the endpoint/model, then submit another categorization run."
+                    )
                     conn.execute(
                         """
                         UPDATE ai_jobs
                         SET status = 'failed', current = ?, total = ?, message = ?, finished_at = ?
                         WHERE id = ?
                         """,
-                        (
-                            idx,
-                            total,
-                            f"Stopped after {consecutive_errors} consecutive Ollama errors. Fix the endpoint/model, then submit another categorization run.",
-                            now_str(),
-                            ai_job_id,
-                        ),
+                        (idx, total, stop_message, now_str(), ai_job_id),
                     )
                     conn.commit()
                     return
@@ -594,10 +743,15 @@ def ai_worker_loop() -> None:
         try:
             run_ai_job_by_id(ai_job_id)
         except Exception as e:  # Keep worker alive even if a job trips an unexpected bug.
+            error_text = f"{type(e).__name__}: {e}"
             with get_db() as conn:
+                job = conn.execute("SELECT scan_id FROM ai_jobs WHERE id = ?", (ai_job_id,)).fetchone()
+                scan_id = int(job["scan_id"]) if job else 0
+                if job:
+                    _log_ai_error(conn, ai_job_id=ai_job_id, scan_id=scan_id, error=error_text, stage="worker")
                 conn.execute(
-                    "UPDATE ai_jobs SET status = 'failed', message = ?, last_error = ?, finished_at = ? WHERE id = ?",
-                    (f"Categorization worker failed: {type(e).__name__}: {e}", f"{type(e).__name__}: {e}", now_str(), ai_job_id),
+                    "UPDATE ai_jobs SET status = 'failed', message = ?, last_error = ?, error_count = error_count + 1, finished_at = ? WHERE id = ?",
+                    (f"Categorization worker failed: {error_text}", error_text, now_str(), ai_job_id),
                 )
                 conn.commit()
         finally:
@@ -612,6 +766,21 @@ def start_ai_worker_once() -> None:
         thread = threading.Thread(target=ai_worker_loop, daemon=True, name="evidence-tool-ai-worker")
         thread.start()
         AI_WORKER_STARTED = True
+
+
+def enqueue_pending_ai_jobs() -> None:
+    """Put queued database jobs back into the in-memory FIFO queue after app startup."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM ai_jobs
+            WHERE status = 'queued' AND cancel_requested = 0
+            ORDER BY id
+            """
+        ).fetchall()
+    for row in rows:
+        AI_QUEUE.put(int(row["id"]))
 
 
 @app.route("/start_ai", methods=["POST"])
@@ -644,7 +813,7 @@ def start_ai():
     )
     start_ai_worker_once()
     AI_QUEUE.put(ai_job_id)
-    return jsonify({"ok": True, "job_id": f"ai-{ai_job_id}", "scan_id": scan_id})
+    return jsonify({"ok": True, "job_id": f"ai-{ai_job_id}", "ai_job_id": ai_job_id, "scan_id": scan_id})
 
 
 def _ai_job_to_client(row) -> dict[str, Any]:
@@ -667,8 +836,45 @@ def _ai_job_to_client(row) -> dict[str, Any]:
             "model": row["model"],
             "error_count": int(row["error_count"] or 0),
             "cancel_requested": bool(row["cancel_requested"]),
+            "error_log_url": url_for("ai_job_errors_page", ai_job_id=int(row["id"])),
+            "log_url": url_for("ai_job_errors_page", ai_job_id=int(row["id"])),
+            "settings_url": url_for("home", scan_id=int(row["scan_id"]), ai_job_id=int(row["id"])),
         },
     }
+
+
+def _ai_job_row_to_dict(row) -> dict[str, Any]:
+    status = row["status"] or ""
+    return {
+        "id": int(row["id"]),
+        "scan_id": int(row["scan_id"]),
+        "scan_label": row["scan_label"] or f"Scan {row['scan_id']}",
+        "status": status,
+        "message": row["message"] or "",
+        "current": int(row["current"] or 0),
+        "total": int(row["total"] or 0),
+        "model": row["model"] or "",
+        "error_count": int(row["error_count"] or 0),
+        "last_error": row["last_error"] or "",
+        "created_at": row["created_at"] or "",
+        "started_at": row["started_at"] or "",
+        "finished_at": row["finished_at"] or "",
+        "cancellable": status not in AI_TERMINAL_STATUSES,
+        "terminal": status in AI_TERMINAL_STATUSES,
+        "load_url": url_for("home", scan_id=int(row["scan_id"]), ai_job_id=int(row["id"])),
+        "settings_url": url_for("home", scan_id=int(row["scan_id"]), ai_job_id=int(row["id"])),
+        "scan_url": url_for("home", scan_id=int(row["scan_id"])),
+        "cancel_url": url_for("cancel_ai_job", ai_job_id=int(row["id"])),
+        "error_url": url_for("ai_job_errors_page", ai_job_id=int(row["id"])),
+        "log_url": url_for("ai_job_errors_page", ai_job_id=int(row["id"])),
+    }
+
+
+@app.route("/api/ai_jobs")
+def api_ai_jobs():
+    with get_db() as conn:
+        rows = _fetch_ai_jobs(conn)
+    return jsonify({"ok": True, "jobs": [_ai_job_row_to_dict(row) for row in rows]})
 
 
 @app.route("/cancel_ai/<int:ai_job_id>", methods=["POST"])
@@ -693,7 +899,7 @@ def cancel_ai_job(ai_job_id: int):
         scan_id = int(job["scan_id"])
     if request.headers.get("X-Requested-With") == "fetch":
         return jsonify({"ok": True})
-    return redirect(url_for("home", scan_id=scan_id))
+    return redirect(url_for("home", scan_id=scan_id, ai_job_id=ai_job_id))
 
 
 @app.route("/job/<job_id>")
@@ -799,6 +1005,114 @@ def export_scan_ai(scan_id: int):
     return csv_response(f"evidence_inventory_with_ai_scan_{scan_id}_{ts}.csv", rows, AI_EXPORT_HEADERS)
 
 
+def load_ai_job_errors(ai_job_id: int) -> tuple[Any | None, list[Any]]:
+    with get_db() as conn:
+        job = conn.execute(
+            """
+            SELECT j.*, s.label AS scan_label
+            FROM ai_jobs j
+            LEFT JOIN scans s ON s.id = j.scan_id
+            WHERE j.id = ?
+            """,
+            (ai_job_id,),
+        ).fetchone()
+        if not job:
+            return None, []
+        errors = conn.execute(
+            """
+            SELECT *
+            FROM ai_errors
+            WHERE ai_job_id = ?
+            ORDER BY id ASC
+            """,
+            (ai_job_id,),
+        ).fetchall()
+        # Keep this log job-specific. Earlier versions showed old ai_results errors
+        # from the same scan here, which made a running/new job look like it already
+        # had failures from a previous categorization attempt.
+        return job, errors
+
+
+def build_ai_error_log_text(job, errors) -> str:
+    if not job:
+        return "Categorization job not found."
+    lines = [
+        f"Evidence Tool categorization error log",
+        f"Job ID: {job['id']}",
+        f"Scan: {job['scan_label'] or job['scan_id']} (ID {job['scan_id']})",
+        f"Status: {job['status']}",
+        f"Model: {job['model'] or ''}",
+        f"Created: {job['created_at'] or ''}",
+        f"Started: {job['started_at'] or ''}",
+        f"Finished: {job['finished_at'] or ''}",
+        f"Message: {job['message'] or ''}",
+        f"Last error: {job['last_error'] or ''}",
+        "",
+        f"Stored error entries: {len(errors)}",
+        "",
+    ]
+    for i, err in enumerate(errors, start=1):
+        lines.extend(
+            [
+                f"--- Error {i} ---",
+                f"Time: {err['created_at'] or ''}",
+                f"Stage: {err['stage'] or ''}",
+                f"File: {err['file_name'] or ''}",
+                f"Path: {err['source_file_path'] or ''}",
+                f"Hash: {err['file_hash'] or ''}",
+                "Error:",
+                err["error"] or "",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+@app.route("/ai_job/<int:ai_job_id>/errors")
+def ai_job_errors_page(ai_job_id: int):
+    job, errors = load_ai_job_errors(ai_job_id)
+    if not job:
+        return Response("Categorization job not found.", status=404, mimetype="text/plain")
+    return render_template("ai_job_log.html", job=job, errors=errors, plain_text=build_ai_error_log_text(job, errors))
+
+
+@app.route("/ai_job/<int:ai_job_id>/errors.txt")
+def ai_job_errors_text(ai_job_id: int):
+    job, errors = load_ai_job_errors(ai_job_id)
+    if not job:
+        return Response("Categorization job not found.", status=404, mimetype="text/plain; charset=utf-8")
+    return Response(build_ai_error_log_text(job, errors), mimetype="text/plain; charset=utf-8")
+
+
+@app.route("/ai_job/<int:ai_job_id>/errors.csv")
+def export_ai_job_errors(ai_job_id: int):
+    def rows():
+        with get_db() as conn:
+            for row in conn.execute(
+                """
+                SELECT id, ai_job_id, scan_id, created_at, file_name, source_file_path, file_hash, stage, error
+                FROM ai_errors
+                WHERE ai_job_id = ?
+                ORDER BY id ASC
+                """,
+                (ai_job_id,),
+            ):
+                yield [
+                    row["id"],
+                    row["ai_job_id"],
+                    row["scan_id"],
+                    row["created_at"] or "",
+                    row["file_name"] or "",
+                    row["source_file_path"] or "",
+                    row["file_hash"] or "",
+                    row["stage"] or "",
+                    row["error"] or "",
+                ]
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    return csv_response(f"evidence_ai_errors_job_{ai_job_id}_{ts}.csv", rows, AI_ERROR_EXPORT_HEADERS)
+
+
 @app.route("/delete_scan/<int:scan_id>", methods=["POST"])
 def delete_scan(scan_id: int):
     with get_db() as conn:
@@ -836,6 +1150,9 @@ def mark_interrupted_ai_jobs() -> None:
 init_db()
 mark_interrupted_ai_jobs()
 start_ai_worker_once()
+enqueue_pending_ai_jobs()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # use_reloader=False prevents Flask's debug reloader from starting duplicate background workers.
+    print(f"Evidence Tool patch {APP_PATCH_ID} loaded from {Path(__file__).resolve()}")
+    app.run(debug=True, use_reloader=False)
