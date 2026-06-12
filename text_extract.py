@@ -14,6 +14,7 @@ from typing import Iterable
 from common import EXTRACT_MAX_CHARS
 
 TEXTLIKE_EXTS = {".txt", ".md", ".markdown", ".log", ".json", ".xml", ".html", ".htm", ".py", ".js", ".css", ".sql"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
 
 
 class ExtractionResult(dict):
@@ -213,6 +214,31 @@ def _extract_eml(path: Path, max_chars: int) -> str:
     return _cap("".join(parts), max_chars)
 
 
+def _extract_image_ocr(path: Path, max_chars: int) -> tuple[str, str, str]:
+    """Best-effort optional OCR for image files.
+
+    This does not make pytesseract/Tesseract a hard dependency. If the Python
+    package or native OCR engine is missing, callers still get a metadata-only
+    status and the categorizer may attach the image directly to a multimodal
+    Ollama model.
+    """
+    try:
+        from PIL import Image
+        import pytesseract
+    except Exception as e:
+        return "", "image_ocr_unavailable", f"Optional OCR dependency unavailable: {type(e).__name__}: {e}"
+
+    try:
+        with Image.open(path) as img:
+            text = pytesseract.image_to_string(img) or ""
+        text = _cap(text.strip(), max_chars)
+        if text.strip():
+            return text, "image_ocr_ok", ""
+        return "", "image_ocr_no_text", "OCR completed but found no usable visible text."
+    except Exception as e:
+        return "", "image_ocr_error", f"{type(e).__name__}: {e}"
+
+
 def extract_text(path: str | Path, max_chars: int = EXTRACT_MAX_CHARS) -> ExtractionResult:
     """Return extracted text plus status metadata.
 
@@ -244,6 +270,9 @@ def extract_text(path: str | Path, max_chars: int = EXTRACT_MAX_CHARS) -> Extrac
         elif ext == ".eml":
             text = _extract_eml(p, max_chars)
             status = "ok"
+        elif ext in IMAGE_EXTS:
+            text, status, error = _extract_image_ocr(p, max_chars)
+            return ExtractionResult(status=status, text=text, chars=len(text), error=error, ocr_text=text, ocr_status=status)
         else:
             text = ""
             status = "unsupported_metadata_only"

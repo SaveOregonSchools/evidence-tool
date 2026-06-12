@@ -13,17 +13,16 @@
   </header>
 
   <section class="panel warning">
-    <strong>Local evidence handling note:</strong> folder/path scanning reads files from the machine running this Flask app. Ollama categorization sends extracted text and metadata to the configured <code>OLLAMA_ENDPOINTS</code>. Keep the endpoint local or trusted.
+    <strong>Local evidence handling note:</strong> folder/path scanning reads files from the machine running this Flask app. Ollama categorization sends extracted text, metadata, and—when enabled for image files—local image data to the configured <code>OLLAMA_ENDPOINTS</code>. Keep the endpoint local or trusted.
   </section>
 
   <main class="grid">
     <section class="panel">
       <h2>Phase 1 — Scan folders or files</h2>
+      {% if scan %}
+      <p class="hint">Settings from the selected scan are loaded below so you can reuse or modify them.</p>
+      {% endif %}
       <form id="scan-form" method="post" action="{{ url_for('start_scan') }}">
-        {% if scan %}
-          <p class="hint loaded-settings">Loaded Phase 1 settings from scan #{{ scan.id }}. Editing these fields and clicking <strong>Start scan</strong> creates a new scan; it does not change the saved scan.</p>
-        {% endif %}
-
         <label>Scan label</label>
         <input name="label" value="{{ scan.label if scan else '' }}" placeholder="e.g., PFL evidence master folder">
 
@@ -54,33 +53,39 @@
     <section class="panel">
       <h2>Phase 2 — Categorize unique files with Ollama</h2>
       {% if scan %}
+      {% set ai_model_value = selected_ai_job.model if selected_ai_job else default_model %}
+      {% set ai_categories_value = selected_ai_job.categories if selected_ai_job else default_categories_text %}
+      {% set ai_context_value = selected_ai_job.context if selected_ai_job else default_project_context %}
+      {% set ai_max_chars_value = selected_ai_job.max_chars if selected_ai_job else default_max_chars %}
+      {% set ai_max_files_value = selected_ai_job.max_files if selected_ai_job and selected_ai_job.max_files else '' %}
+      {% if selected_ai_job %}
+      <p class="hint">Loaded settings from categorization job #{{ selected_ai_job.id }}. Submitting creates a new queued job.</p>
+      {% endif %}
       <form id="ai-form" method="post" action="{{ url_for('start_ai') }}">
         <input type="hidden" name="scan_id" value="{{ scan.id }}">
-        {% if selected_ai_job %}
-          <p class="hint loaded-settings">Loaded Phase 2 settings from categorization job #{{ selected_ai_job.id }} for scan #{{ selected_ai_job.scan_id }}. Editing these fields and clicking <strong>Categorize unique files</strong> creates a new queued job.</p>
-        {% endif %}
-
         <label>Ollama model</label>
-        <input name="model" value="{{ selected_ai_job.model if selected_ai_job and selected_ai_job.model else default_model }}" placeholder="e.g., llama3.1:8b, qwen2.5:14b">
+        <input name="model" value="{{ ai_model_value or '' }}" placeholder="e.g., gemma4:12b, qwen3.5:9b">
 
         <label>Categories to use</label>
-        <textarea name="categories" rows="5" placeholder="Key correspondence&#10;Meeting materials&#10;Funding / grants&#10;Legal / policy documents&#10;Media / public communications&#10;Other / Unclear">{{ selected_ai_job.categories if selected_ai_job else '' }}</textarea>
+        <textarea name="categories" rows="8" placeholder="One allowed primary category per line">{{ ai_categories_value or '' }}</textarea>
+        <p class="hint">The default list uses one required primary category. The app validates model output against this list and retries once if the category is invalid.</p>
 
         <label>Investigation / project context</label>
-        <textarea name="context" rows="5" placeholder="Describe the case, project, organizations, people, time period, and what you want the model to pay attention to. The app tells the model to use this as background, not as a generic description of every file.">{{ selected_ai_job.context if selected_ai_job else '' }}</textarea>
+        <textarea name="context" rows="7" placeholder="Describe the case, project, organizations, people, time period, and what you want the model to pay attention to. The app tells the model to use this as background, not as a generic description of every file.">{{ ai_context_value or '' }}</textarea>
 
         <div class="row two">
           <div>
             <label>Max extracted chars per file</label>
-            <input name="max_chars" type="number" value="{{ selected_ai_job.max_chars if selected_ai_job and selected_ai_job.max_chars else default_max_chars }}" min="1000" step="1000">
+            <input name="max_chars" type="number" value="{{ ai_max_chars_value }}" min="1000" step="1000">
           </div>
           <div>
             <label>Max unique files this run</label>
-            <input name="max_files" type="number" min="1" value="{{ selected_ai_job.max_files if selected_ai_job and selected_ai_job.max_files else '' }}" placeholder="blank = all remaining">
+            <input name="max_files" type="number" min="1" value="{{ ai_max_files_value }}" placeholder="blank = all remaining">
           </div>
         </div>
 
-        <label class="checkbox"><input type="checkbox" name="force" {% if selected_ai_job and selected_ai_job.force %}checked{% endif %}> Re-run files already categorized</label>
+        <p class="hint">Image support: {% if ai_send_images %}enabled{% else %}disabled{% endif %}. Max image bytes sent to Ollama: {{ image_max_bytes }}. OCR is optional and used only if local OCR dependencies are available.</p>
+        <label class="checkbox"><input type="checkbox" name="force"> Re-run files already categorized</label>
         <button type="submit">Categorize unique files</button>
       </form>
       {% else %}
@@ -96,16 +101,13 @@
     </div>
     <div class="progress"><div id="job-bar"></div></div>
     <p id="job-message">Queued...</p>
-    <p id="job-error-link-wrap" class="hidden"><a id="job-error-link" href="#">Open categorization error log</a></p>
+    <p id="job-log-link" class="hidden"></p>
     <pre id="job-errors"></pre>
   </section>
 
   <section class="panel">
     <div class="toolbar">
-      <div>
-        <h2>Scans</h2>
-        <p class="hint">Click a scan label to reload its Phase 1 settings into the scan form.</p>
-      </div>
+      <h2>Scans</h2>
       <form method="post" action="{{ url_for('clear_uploads') }}" onsubmit="return confirm('Remove uploaded staging files under uploads/? This will not delete original path-scanned evidence.');">
         <button class="secondary" type="submit">Clear staged uploads</button>
       </form>
@@ -138,48 +140,43 @@
     {% endif %}
   </section>
 
-  <section class="panel">
-    <div class="toolbar wrap">
-      <div>
-        <h2>Categorization jobs</h2>
-        <p class="muted">Ollama categorization runs one job at a time. New requests are queued until the current job finishes or is cancelled. Click a job ID to reload its Phase 2 settings.</p>
-      </div>
-      <button id="refresh-ai-jobs" class="secondary" type="button">Refresh jobs</button>
-    </div>
-    <div id="ai-jobs-container" data-selected-ai-job-id="{{ selected_ai_job.id if selected_ai_job else '' }}" data-current-scan-id="{{ scan.id if scan else '' }}">
-      {% if ai_jobs %}
-      <table class="compact">
-        <thead>
-          <tr>
-            <th>ID</th><th>Scan</th><th>Status</th><th>Progress</th><th>Model</th><th>Errors</th><th>Created</th><th>Started</th><th>Finished</th><th></th>
-          </tr>
-        </thead>
-        <tbody>
-        {% for j in ai_jobs %}
-          <tr class="{% if selected_ai_job and j.id == selected_ai_job.id %}selected{% endif %}">
-            <td><a href="{{ url_for('home', scan_id=j.scan_id, ai_job_id=j.id) }}">{{ j.id }}</a></td>
-            <td>{% if j.scan_label %}<a href="{{ url_for('home', scan_id=j.scan_id) }}">{{ j.scan_label }}</a>{% else %}Scan {{ j.scan_id }}{% endif %}</td>
-            <td>{{ j.status }}</td>
-            <td>{{ j.current }} / {{ j.total }}</td>
-            <td>{{ j.model or '' }}</td>
-            <td title="{{ j.last_error or '' }}">{% if j.error_count %}<a href="{{ url_for('ai_job_errors_page', ai_job_id=j.id) }}">{{ j.error_count }}</a>{% else %}0{% endif %}</td>
-            <td>{{ j.created_at }}</td>
-            <td>{{ j.started_at or '' }}</td>
-            <td>{{ j.finished_at or '' }}</td>
-            <td>
-              {% if j.error_count %}<a class="button secondary tiny" href="{{ url_for('ai_job_errors_page', ai_job_id=j.id) }}">Log</a>{% endif %}
-              {% if j.status not in ai_terminal_statuses %}
-              <button class="danger tiny" type="button" data-cancel-ai-job-id="{{ j.id }}">Cancel</button>
-              {% endif %}
-            </td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-      {% else %}
-        <p class="muted">No categorization jobs yet.</p>
-      {% endif %}
-    </div>
+  <section class="panel" id="ai-jobs-panel">
+    <h2>Categorization jobs</h2>
+    <p class="muted">Ollama categorization runs one job at a time. New requests are queued until the current job finishes or is cancelled. Click a job ID to reload its saved Phase 2 settings.</p>
+    {% if ai_jobs %}
+    <table class="compact">
+      <thead>
+        <tr>
+          <th>ID</th><th>Scan</th><th>Status</th><th>Progress</th><th>Model</th><th>Errors</th><th>Created</th><th>Started</th><th>Finished</th><th>Log</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="ai-jobs-body">
+      {% for j in ai_jobs %}
+        <tr class="{% if selected_ai_job and selected_ai_job.id == j.id %}selected{% endif %}">
+          <td><a href="{{ url_for('home', scan_id=j.scan_id, ai_job_id=j.id) }}">{{ j.id }}</a></td>
+          <td>{% if j.scan_label %}<a href="{{ url_for('home', scan_id=j.scan_id) }}">{{ j.scan_label }}</a>{% else %}Scan {{ j.scan_id }}{% endif %}</td>
+          <td>{{ j.status }}</td>
+          <td>{{ j.current }} / {{ j.total }}</td>
+          <td>{{ j.model or '' }}</td>
+          <td title="{{ j.last_error or '' }}">{{ j.error_count }}</td>
+          <td>{{ j.created_at }}</td>
+          <td>{{ j.started_at or '' }}</td>
+          <td>{{ j.finished_at or '' }}</td>
+          <td><a href="{{ url_for('ai_job_errors_page', ai_job_id=j.id) }}">Open</a></td>
+          <td>
+            {% if j.status not in ai_terminal_statuses %}
+            <form method="post" action="{{ url_for('cancel_ai_job', ai_job_id=j.id) }}" onsubmit="return confirm('Cancel this categorization job? If Ollama is currently processing a file, the job will stop after that request returns.');">
+              <button class="danger tiny" type="submit">Cancel</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">No categorization jobs yet.</p>
+    {% endif %}
   </section>
 
   {% if scan %}
@@ -248,8 +245,16 @@
             <th>Creation date</th>
             <th>Size (MB)</th>
             <th>Hash</th>
-            <th>AI category</th>
+            <th>AI primary category</th>
+            <th>AI secondary tags</th>
+            <th>AI confidence</th>
             <th>AI description</th>
+            <th>AI evidence basis</th>
+            <th>AI key people</th>
+            <th>AI key organizations</th>
+            <th>AI date or event</th>
+            <th>AI why useful</th>
+            <th>AI review?</th>
             <th>AI status</th>
           </tr>
         </thead>
@@ -264,8 +269,16 @@
             <td>{{ "%.1f"|format(f.size_mb or 0) }}</td>
             <td class="hash">{{ f.file_hash }}</td>
             <td>{{ f.ai_category or '' }}</td>
+            <td>{{ f.ai_secondary_tags or '' }}</td>
+            <td>{% if f.ai_confidence is not none %}{{ "%.2f"|format(f.ai_confidence) }}{% endif %}</td>
             <td class="description">{{ f.ai_description or '' }}</td>
-            <td>{{ f.ai_status or 'not_started' }}</td>
+            <td>{{ f.ai_evidence_basis or '' }}</td>
+            <td>{{ f.ai_key_people or '' }}</td>
+            <td>{{ f.ai_key_organizations or '' }}</td>
+            <td>{{ f.ai_date_or_event or '' }}</td>
+            <td class="description">{{ f.ai_why_useful_as_evidence or '' }}</td>
+            <td>{% if f.ai_needs_human_review %}true{% elif f.ai_status %}false{% endif %}</td>
+            <td title="{{ f.ai_original_category or '' }}">{{ f.ai_status or 'not_started' }}</td>
           </tr>
           {% endfor %}
         </tbody>

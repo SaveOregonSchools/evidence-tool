@@ -1,4 +1,4 @@
-"""Shared configuration and database helpers for evidence-tool."""
+"""Shared configuration, defaults, and database helpers for evidence-tool."""
 from __future__ import annotations
 
 import os
@@ -33,6 +33,16 @@ OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
 OLLAMA_RETRIES = int(os.getenv("OLLAMA_RETRIES", "2"))
 OLLAMA_RETRY_DELAY = float(os.getenv("OLLAMA_RETRY_DELAY", "3"))
 
+
+def _truthy_env(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+# Image handling is optional. When enabled, the categorizer attaches local image
+# files to the Ollama /api/chat request for multimodal models such as Gemma.
+AI_SEND_IMAGES = _truthy_env("EVIDENCE_AI_SEND_IMAGES", "true")
+IMAGE_MAX_BYTES = int(os.getenv("EVIDENCE_IMAGE_MAX_BYTES", str(10 * 1024 * 1024)))
+
 CORE_EXPORT_HEADERS = [
     "File name",
     "Type of file",
@@ -44,8 +54,17 @@ CORE_EXPORT_HEADERS = [
 ]
 
 AI_EXPORT_HEADERS = CORE_EXPORT_HEADERS + [
-    "AI category",
+    "AI primary category",
+    "AI secondary tags",
+    "AI confidence",
     "AI description",
+    "AI evidence basis",
+    "AI key people",
+    "AI key organizations",
+    "AI date or event",
+    "AI why useful as evidence",
+    "AI needs human review",
+    "AI original category",
     "AI status",
 ]
 
@@ -59,6 +78,107 @@ AI_ERROR_EXPORT_HEADERS = [
     "Hash",
     "Stage",
     "Error",
+]
+
+DEFAULT_PRIMARY_CATEGORIES = [
+    "Network assembly / convening materials",
+    "Participant / attendee lists",
+    "People / organization directory",
+    "Network strategy / governance / regeneration",
+    "Work group / priority-area planning",
+    "Policy framework / policy agenda",
+    "Community schools",
+    "Shared Story / narrative / communications strategy",
+    "Education resourcing / school funding",
+    "Teacher / educator workforce",
+    "Federal funding / ARP / COVID response",
+    "Place-based / Key Places strategy",
+    "Research / evaluation / findings report",
+    "Public education defense / voucher-privatization response",
+    "Administrative logistics / internal run-of-show",
+    "General network announcement / member update",
+    "Unrelated or insufficient evidence",
+]
+
+DEFAULT_CATEGORIES_TEXT = "\n".join(DEFAULT_PRIMARY_CATEGORIES)
+
+DEFAULT_PROJECT_CONTEXT = """This evidence set concerns the Partnership for the Future of Learning, also known as PFL, a national education and social justice network connected to public education policy, narrative strategy, community schools, education resourcing, teacher/educator workforce issues, federal COVID/ARP funding, place-based strategy, and efforts to defend public education from vouchers, privatization, and political attacks.
+
+Use this background only to understand likely terminology and context. Do not assume every file is about PFL. Do not write a generic statement that a file is “about PFL” unless the file’s text, visible image content, or metadata supports that.
+
+Your task is to classify and summarize the individual file itself. Describe what the file contains, why it may matter in an evidence set, and whether the description is based on extracted text, visible image text, metadata, filename, or a mix of those sources."""
+
+CATEGORY_DEFINITIONS_TEXT = """Category definitions:
+
+Network assembly / convening materials:
+Use for event decks, assembly programs, meeting materials, convening slides, or documents created for a specific PFL convening or assembly. Do not use for participant lists or travel logistics.
+
+Participant / attendee lists:
+Use for rosters of people attending a specific event, assembly, retreat, council meeting, or convening.
+
+People / organization directory:
+Use for broad lists of people, organizations, roles, affiliations, or contact information that are not limited to one specific event.
+
+Network strategy / governance / regeneration:
+Use for documents about PFL’s overall network structure, Strategy Council, Steering Committee, governance model, Strategy Regeneration, network model, decision-making, power sharing, or long-term network organization.
+
+Work group / priority-area planning:
+Use for documents about a specific PFL work group, priority group, or recurring internal planning space that is not better classified under a topical category like Community Schools, Shared Story, or Education Resourcing.
+
+Policy framework / policy agenda:
+Use for policy frameworks, model legislation, policy agendas, formal policy recommendations, or policy toolkits.
+
+Community schools:
+Use for documents primarily about community schools, full-service community schools, community school policy, story strategy, financing, implementation, or writing-group work.
+
+Shared Story / narrative / communications strategy:
+Use for documents primarily about narrative strategy, framing, storytelling, communications strategy, story production, Shared Story, circle calls, messaging guidance, communications toolkits, or media strategy.
+
+Education resourcing / school funding:
+Use for documents primarily about school funding, education resourcing, adequate/equitable funding, state/local/federal school finance, public education funding narratives, or school finance advocacy.
+
+Teacher / educator workforce:
+Use for documents primarily about teachers, educator workforce, teacher diversity, educator preparation, recruitment, retention, profession strategy, or educator pipeline issues.
+
+Federal funding / ARP / COVID response:
+Use for documents primarily about ARP, ESSER, CARES, CRRSA, COVID response, federal relief funding, emergency response, or federal funding strategy.
+
+Place-based / Key Places strategy:
+Use for documents primarily about Key Places, place-based strategy, state/local partnerships, regional ecosystem work, local coalition strategy, or place-based network development.
+
+Research / evaluation / findings report:
+Use for formal research reports, evaluation reports, findings memos, landscape scans, survey findings, research summaries, or evidence reviews.
+
+Public education defense / voucher-privatization response:
+Use for documents, screenshots, graphics, or campaign materials focused on vouchers, privatization, attacks on public education, parent-rights campaigns, book bans, anti-CRT/anti-DEI attacks, or defending public schools from political/campaign threats.
+
+Administrative logistics / internal run-of-show:
+Use for travel support, reimbursement instructions, hotel/flight logistics, payment setup, internal staff run-of-show documents, operational checklists, or meeting production notes. Do not use this category merely because a document contains an agenda.
+
+General network announcement / member update:
+Use for email announcements, newsletters, member updates, leadership announcements, event invitations, or general network communications that are not primarily one of the topical categories above.
+
+Unrelated or insufficient evidence:
+Use only when the file does not appear related to PFL or when the available text, visible image content, metadata, and filename are too limited to classify confidently."""
+
+CATEGORY_PRECEDENCE_RULES_TEXT = """Classification precedence rules:
+1. If the file is a participant list for a specific event, choose Participant / attendee lists, even if it mentions strategy, assemblies, organizations, or network members.
+2. If the file is a broad directory of people or organizations not tied to one event, choose People / organization directory.
+3. If the file is travel, reimbursement, booking, payment setup, hotel block, transportation, or meeting production logistics, choose Administrative logistics / internal run-of-show.
+4. If the file is about PFL’s network model, governance, Strategy Council, Steering Committee, Strategy Regeneration, power sharing, work group structure, funder group, or long-term network organization, choose Network strategy / governance / regeneration.
+5. If the file is about vouchers, privatization, or defending public education from political attacks, choose Public education defense / voucher-privatization response, even if school funding is also mentioned.
+6. If the file is about ARP, ESSER, CARES, CRRSA, or COVID relief funding, choose Federal funding / ARP / COVID response.
+7. If the file is primarily about community schools, choose Community schools unless the document is mainly a formal evaluation, findings report, or research report.
+8. If the file is a formal evaluation, findings report, landscape scan, or research report, choose Research / evaluation / findings report unless a more specific category is clearly dominant.
+9. If the file is a general email, newsletter, invitation, or announcement and no more specific topical category dominates, choose General network announcement / member update.
+10. If multiple categories apply, choose the category that best describes the document’s dominant purpose and likely evidentiary use."""
+
+EVIDENCE_BASIS_VALUES = [
+    "extracted text",
+    "visible image text",
+    "metadata only",
+    "filename only",
+    "mixed",
 ]
 
 
@@ -192,6 +312,18 @@ def init_db() -> None:
         _ensure_column(conn, "ai_results", "raw_response", "raw_response TEXT")
         _ensure_column(conn, "ai_results", "model", "model TEXT")
         _ensure_column(conn, "ai_results", "extraction_status", "extraction_status TEXT")
+        _ensure_column(conn, "ai_results", "secondary_tags", "secondary_tags TEXT")
+        _ensure_column(conn, "ai_results", "confidence", "confidence REAL")
+        _ensure_column(conn, "ai_results", "evidence_basis", "evidence_basis TEXT")
+        _ensure_column(conn, "ai_results", "key_people", "key_people TEXT")
+        _ensure_column(conn, "ai_results", "key_organizations", "key_organizations TEXT")
+        _ensure_column(conn, "ai_results", "date_or_event", "date_or_event TEXT")
+        _ensure_column(conn, "ai_results", "why_useful_as_evidence", "why_useful_as_evidence TEXT")
+        _ensure_column(conn, "ai_results", "needs_human_review", "needs_human_review INTEGER DEFAULT 0")
+        _ensure_column(conn, "ai_results", "category_valid", "category_valid INTEGER DEFAULT 1")
+        _ensure_column(conn, "ai_results", "original_category", "original_category TEXT")
+        _ensure_column(conn, "ai_results", "image_sent", "image_sent INTEGER DEFAULT 0")
+        _ensure_column(conn, "ai_results", "ocr_status", "ocr_status TEXT")
         _ensure_column(conn, "ai_errors", "file_name", "file_name TEXT")
         _ensure_column(conn, "ai_errors", "source_file_path", "source_file_path TEXT")
         _ensure_column(conn, "ai_errors", "stage", "stage TEXT")

@@ -19,7 +19,7 @@ from common import (
     OLLAMA_TIMEOUT,
 )
 
-PATCH_ID = "2026-06-12-ollama-thinking-v3"
+PATCH_ID = "2026-06-12-evidence-fields-v1"
 
 
 class OllamaClientError(RuntimeError):
@@ -167,7 +167,7 @@ def _payload_variants(payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]
 
 
 def chat(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     model: str | None = None,
     temperature: float = 0.1,

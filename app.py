@@ -20,8 +20,12 @@ from common import (
     AI_EXPORT_HEADERS,
     AI_MAX_CONSECUTIVE_ERRORS,
     CORE_EXPORT_HEADERS,
+    DEFAULT_CATEGORIES_TEXT,
+    DEFAULT_PROJECT_CONTEXT,
     EXTRACT_MAX_CHARS,
     HASH_ALGO,
+    AI_SEND_IMAGES,
+    IMAGE_MAX_BYTES,
     OLLAMA_MODEL,
     UPLOAD_DIR,
     get_db,
@@ -29,7 +33,7 @@ from common import (
 )
 from evidence_scanner import parse_paths, scan_files
 
-APP_PATCH_ID = "2026-06-12-ollama-thinking-v3"
+APP_PATCH_ID = "2026-06-12-evidence-fields-v1"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20GB; local-only app, override in deployment if needed.
@@ -42,7 +46,7 @@ JOBS_LOCK = threading.Lock()
 AI_QUEUE: Queue[int] = Queue()
 AI_WORKER_LOCK = threading.Lock()
 AI_WORKER_STARTED = False
-AI_SUCCESS_STATUSES = {"ok", "parsed_fields"}
+AI_SUCCESS_STATUSES = {"ok", "parsed_fields", "category_retry_ok", "invalid_category_fallback"}
 AI_TERMINAL_STATUSES = {"done", "failed", "cancelled", "interrupted"}
 
 
@@ -268,7 +272,19 @@ def fetch_dashboard(scan_id: int | None, selected_ai_job_id: int | None = None) 
             if scan:
                 files = conn.execute(
                     """
-                    SELECT f.*, a.category AS ai_category, a.description AS ai_description, a.status AS ai_status
+                    SELECT f.*,
+                           a.category AS ai_category,
+                           a.secondary_tags AS ai_secondary_tags,
+                           a.confidence AS ai_confidence,
+                           a.description AS ai_description,
+                           a.evidence_basis AS ai_evidence_basis,
+                           a.key_people AS ai_key_people,
+                           a.key_organizations AS ai_key_organizations,
+                           a.date_or_event AS ai_date_or_event,
+                           a.why_useful_as_evidence AS ai_why_useful_as_evidence,
+                           a.needs_human_review AS ai_needs_human_review,
+                           a.original_category AS ai_original_category,
+                           a.status AS ai_status
                     FROM files f
                     LEFT JOIN ai_results a
                       ON a.scan_id = f.scan_id AND a.file_hash = f.file_hash
@@ -320,6 +336,10 @@ def fetch_dashboard(scan_id: int | None, selected_ai_job_id: int | None = None) 
             "ai_counts": ai_counts,
             "default_model": OLLAMA_MODEL,
             "default_max_chars": EXTRACT_MAX_CHARS,
+            "default_categories_text": DEFAULT_CATEGORIES_TEXT,
+            "default_project_context": DEFAULT_PROJECT_CONTEXT,
+            "ai_send_images": AI_SEND_IMAGES,
+            "image_max_bytes": IMAGE_MAX_BYTES,
             "hash_algo": HASH_ALGO,
             "ai_terminal_statuses": AI_TERMINAL_STATUSES,
         }
@@ -340,6 +360,8 @@ def debug_version():
             "ollama_client_file": str(Path(ollama_client.__file__).resolve()),
             "ollama_think": getattr(ollama_client, "OLLAMA_THINK", None),
             "ollama_endpoints": getattr(ollama_client, "NORMALIZED_OLLAMA_ENDPOINTS", []),
+            "ai_send_images": AI_SEND_IMAGES,
+            "image_max_bytes": IMAGE_MAX_BYTES,
         }
     )
 
@@ -638,7 +660,9 @@ def run_ai_job_by_id(ai_job_id: int) -> None:
                     status = 'running',
                     error = NULL,
                     updated_at = excluded.updated_at,
-                    model = excluded.model
+                    model = excluded.model,
+                    original_category = NULL,
+                    category_valid = 1
                 """,
                 (scan_id, row["file_hash"], row["id"], row["full_path"], now_str(), job["model"]),
             )
@@ -657,13 +681,26 @@ def run_ai_job_by_id(ai_job_id: int) -> None:
                 conn.execute(
                     """
                     UPDATE ai_results
-                    SET category = ?, description = ?, status = ?, error = ?, extracted_chars = ?, updated_at = ?,
-                        raw_response = ?, model = ?, extraction_status = ?
+                    SET category = ?, secondary_tags = ?, confidence = ?, description = ?, evidence_basis = ?,
+                        key_people = ?, key_organizations = ?, date_or_event = ?, why_useful_as_evidence = ?,
+                        needs_human_review = ?, original_category = ?, category_valid = ?,
+                        status = ?, error = ?, extracted_chars = ?, updated_at = ?,
+                        raw_response = ?, model = ?, extraction_status = ?, image_sent = ?, ocr_status = ?
                     WHERE scan_id = ? AND file_hash = ?
                     """,
                     (
-                        result.get("category"),
+                        result.get("primary_category") or result.get("category"),
+                        result.get("secondary_tags") or "",
+                        result.get("confidence"),
                         result.get("description"),
+                        result.get("evidence_basis") or "",
+                        result.get("key_people") or "",
+                        result.get("key_organizations") or "",
+                        result.get("date_or_event") or "",
+                        result.get("why_useful_as_evidence") or "",
+                        1 if result.get("needs_human_review") else 0,
+                        result.get("original_category") or "",
+                        int(result.get("category_valid") if result.get("category_valid") is not None else 1),
                         status,
                         result.get("extraction_error") or "",
                         int(result.get("extracted_chars") or 0),
@@ -671,6 +708,8 @@ def run_ai_job_by_id(ai_job_id: int) -> None:
                         result.get("raw_response") or "",
                         job["model"],
                         result.get("extraction_status") or "",
+                        int(result.get("image_sent") or 0),
+                        result.get("ocr_status") or "",
                         scan_id,
                         row["file_hash"],
                     ),
@@ -788,8 +827,8 @@ def start_ai():
     scan_id = request.form.get("scan_id", type=int)
     if not scan_id:
         return jsonify({"ok": False, "error": "No scan selected."}), 400
-    categories = request.form.get("categories", "")
-    context = request.form.get("context", "")
+    categories = request.form.get("categories", "").strip() or DEFAULT_CATEGORIES_TEXT
+    context = request.form.get("context", "").strip()
     model = request.form.get("model", "").strip() or OLLAMA_MODEL
     force = request.form.get("force") in {"on", "true", "1", "yes"}
     try:
@@ -979,7 +1018,9 @@ def export_scan_ai(scan_id: int):
                 """
                 SELECT f.file_name, f.file_type, f.folder_location, f.last_modified_date,
                        f.creation_date, f.size_mb, f.file_hash,
-                       a.category, a.description, a.status AS ai_status
+                       a.category, a.secondary_tags, a.confidence, a.description, a.evidence_basis,
+                       a.key_people, a.key_organizations, a.date_or_event, a.why_useful_as_evidence,
+                       a.needs_human_review, a.original_category, a.status AS ai_status
                 FROM files f
                 LEFT JOIN ai_results a
                   ON a.scan_id = f.scan_id AND a.file_hash = f.file_hash
@@ -997,7 +1038,16 @@ def export_scan_ai(scan_id: int):
                     f"{float(row['size_mb'] or 0):.1f}",
                     row["file_hash"],
                     row["category"] or "",
+                    row["secondary_tags"] or "",
+                    "" if row["confidence"] is None else f"{float(row['confidence']):.2f}",
                     row["description"] or "",
+                    row["evidence_basis"] or "",
+                    row["key_people"] or "",
+                    row["key_organizations"] or "",
+                    row["date_or_event"] or "",
+                    row["why_useful_as_evidence"] or "",
+                    "true" if row["needs_human_review"] else "false",
+                    row["original_category"] or "",
                     row["ai_status"] or "not_started",
                 ]
 
