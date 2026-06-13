@@ -29,10 +29,10 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 18px 0; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .table-wrap { overflow: auto; max-height: 70vh; border: 1px solid var(--border); border-radius: 10px; }
 table { border-collapse: collapse; width: 100%; font-size: .92rem; }
-th, td { border-bottom: 1px solid #eceef3; padding: 8px; text-align: left; vertical-align: top; }
+th, td { border-bottom: 1px solid #eceef3; padding: 8px; text-align: left; vertical-align: top; white-space: nowrap; }
 thead th { background: #f0f3f8; position: sticky; top: 0; z-index: 1; }
-td { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-td.description { white-space: normal; min-width: 360px; }
+td { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+td.description { white-space: nowrap; min-width: 360px; max-width: 560px; }
 td.hash, .hash { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .82rem; max-width: 260px; }
 table.compact td, table.compact th { padding: 6px; }
 tr.selected { background: #eef4ff; }

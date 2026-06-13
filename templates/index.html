@@ -61,14 +61,18 @@
       {% if selected_ai_job %}
       <p class="hint">Loaded settings from categorization job #{{ selected_ai_job.id }}. Submitting creates a new queued job.</p>
       {% endif %}
-      <form id="ai-form" method="post" action="{{ url_for('start_ai') }}">
+      <form id="ai-form" method="post" action="{{ url_for('start_ai') }}" enctype="multipart/form-data">
         <input type="hidden" name="scan_id" value="{{ scan.id }}">
         <label>Ollama model</label>
         <input name="model" value="{{ ai_model_value or '' }}" placeholder="e.g., gemma4:12b, qwen3.5:9b">
 
-        <label>Categories to use</label>
-        <textarea name="categories" rows="8" placeholder="One allowed primary category per line">{{ ai_categories_value or '' }}</textarea>
-        <p class="hint">The default list uses one required primary category. The app validates model output against this list and retries once if the category is invalid.</p>
+        <label>Categories to use, with optional definitions</label>
+        <textarea id="categories-textarea" name="categories" rows="8" placeholder="One category per line, or Category Name: Category definition">{{ ai_categories_value or '' }}</textarea>
+        <p class="hint">You can enter one category per line, or use <code>Category Name: Category definition</code>. The app validates model output against the category names and passes definitions to the model as guidance.</p>
+
+        <label>Optional category-definition CSV</label>
+        <input id="category-csv-input" type="file" name="category_csv" accept=".csv,text/csv">
+        <p class="hint">CSV format: first column = category name, second column = definition/description. Selecting a CSV will also preview/import it into the category box above before submission.</p>
 
         <label>Investigation / project context</label>
         <textarea name="context" rows="7" placeholder="Describe the case, project, organizations, people, time period, and what you want the model to pay attention to. The app tells the model to use this as background, not as a generic description of every file.">{{ ai_context_value or '' }}</textarea>
@@ -242,7 +246,6 @@
             <th>Type of file</th>
             <th>Folder location</th>
             <th>Last modified date</th>
-            <th>Creation date</th>
             <th>Size (MB)</th>
             <th>Hash</th>
             <th>AI primary category</th>
@@ -262,23 +265,22 @@
           {% for f in files %}
           <tr>
             <td title="{{ f.full_path }}">{{ f.file_name }}</td>
-            <td>{{ f.file_type }}</td>
-            <td>{{ f.folder_location }}</td>
-            <td>{{ f.last_modified_date }}</td>
-            <td>{{ f.creation_date }}</td>
-            <td>{{ "%.1f"|format(f.size_mb or 0) }}</td>
-            <td class="hash">{{ f.file_hash }}</td>
-            <td>{{ f.ai_category or '' }}</td>
-            <td>{{ f.ai_secondary_tags or '' }}</td>
-            <td>{% if f.ai_confidence is not none %}{{ "%.2f"|format(f.ai_confidence) }}{% endif %}</td>
-            <td class="description">{{ f.ai_description or '' }}</td>
-            <td>{{ f.ai_evidence_basis or '' }}</td>
-            <td>{{ f.ai_key_people or '' }}</td>
-            <td>{{ f.ai_key_organizations or '' }}</td>
-            <td>{{ f.ai_date_or_event or '' }}</td>
-            <td class="description">{{ f.ai_why_useful_as_evidence or '' }}</td>
-            <td>{% if f.ai_needs_human_review %}true{% elif f.ai_status %}false{% endif %}</td>
-            <td title="{{ f.ai_original_category or '' }}">{{ f.ai_status or 'not_started' }}</td>
+            <td title="{{ f.file_type or '' }}">{{ f.file_type }}</td>
+            <td title="{{ f.folder_location or '' }}">{{ f.folder_location }}</td>
+            <td title="{{ f.last_modified_date or '' }}">{{ f.last_modified_date }}</td>
+            <td title="{{ "%.1f"|format(f.size_mb or 0) }}">{{ "%.1f"|format(f.size_mb or 0) }}</td>
+            <td class="hash" title="{{ f.file_hash or '' }}">{{ f.file_hash }}</td>
+            <td title="{{ f.ai_category or '' }}">{{ f.ai_category or '' }}</td>
+            <td title="{{ f.ai_secondary_tags or '' }}">{{ f.ai_secondary_tags or '' }}</td>
+            <td title="{% if f.ai_confidence is not none %}{{ "%.2f"|format(f.ai_confidence) }}{% endif %}">{% if f.ai_confidence is not none %}{{ "%.2f"|format(f.ai_confidence) }}{% endif %}</td>
+            <td class="description" title="{{ f.ai_description or '' }}">{{ f.ai_description or '' }}</td>
+            <td title="{{ f.ai_evidence_basis or '' }}">{{ f.ai_evidence_basis or '' }}</td>
+            <td title="{{ f.ai_key_people or '' }}">{{ f.ai_key_people or '' }}</td>
+            <td title="{{ f.ai_key_organizations or '' }}">{{ f.ai_key_organizations or '' }}</td>
+            <td title="{{ f.ai_date_or_event or '' }}">{{ f.ai_date_or_event or '' }}</td>
+            <td class="description" title="{{ f.ai_why_useful_as_evidence or '' }}">{{ f.ai_why_useful_as_evidence or '' }}</td>
+            <td title="{% if f.ai_needs_human_review %}true{% elif f.ai_status %}false{% endif %}">{% if f.ai_needs_human_review %}true{% elif f.ai_status %}false{% endif %}</td>
+            <td title="{{ f.ai_status or 'not_started' }}">{{ f.ai_status or 'not_started' }}</td>
           </tr>
           {% endfor %}
         </tbody>

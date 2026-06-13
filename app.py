@@ -33,7 +33,7 @@ from common import (
 )
 from evidence_scanner import parse_paths, scan_files
 
-APP_PATCH_ID = "2026-06-12-category-validation-v3"
+APP_PATCH_ID = "2026-06-13-ui-category-confidence-v1"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20GB; local-only app, override in deployment if needed.
@@ -283,7 +283,6 @@ def fetch_dashboard(scan_id: int | None, selected_ai_job_id: int | None = None) 
                            a.date_or_event AS ai_date_or_event,
                            a.why_useful_as_evidence AS ai_why_useful_as_evidence,
                            a.needs_human_review AS ai_needs_human_review,
-                           a.original_category AS ai_original_category,
                            a.status AS ai_status
                     FROM files f
                     LEFT JOIN ai_results a
@@ -644,7 +643,6 @@ def run_ai_job_by_id(ai_job_id: int) -> None:
                 "file_type": row["file_type"],
                 "folder_location": row["folder_location"],
                 "last_modified_date": row["last_modified_date"],
-                "creation_date": row["creation_date"],
                 "size_mb": row["size_mb"],
                 "hash": row["file_hash"],
                 "hash_algorithm": row["hash_algo"],
@@ -822,12 +820,47 @@ def enqueue_pending_ai_jobs() -> None:
         AI_QUEUE.put(int(row["id"]))
 
 
+def _categories_from_uploaded_csv() -> str:
+    """Return category definition lines from an optional two-column CSV upload."""
+    uploaded = request.files.get("category_csv")
+    if not uploaded or not uploaded.filename:
+        return ""
+    try:
+        raw = uploaded.read()
+        text = raw.decode("utf-8-sig", errors="replace")
+        reader = csv.reader(io.StringIO(text))
+        lines: list[str] = []
+        for row in reader:
+            if not row:
+                continue
+            name = str(row[0] if len(row) > 0 else "").strip()
+            definition = str(row[1] if len(row) > 1 else "").strip()
+            if not name:
+                continue
+            lowered = name.casefold()
+            # Skip common header rows such as category,definition.
+            if lowered in {"category", "category name", "primary category", "name"}:
+                continue
+            if definition:
+                lines.append(f"{name}: {definition}")
+            else:
+                lines.append(name)
+        return "\n".join(lines)
+    except Exception as e:
+        raise ValueError(f"Could not read category CSV: {type(e).__name__}: {e}") from e
+
+
 @app.route("/start_ai", methods=["POST"])
 def start_ai():
     scan_id = request.form.get("scan_id", type=int)
     if not scan_id:
         return jsonify({"ok": False, "error": "No scan selected."}), 400
-    categories = normalize_categories_text(request.form.get("categories", "").strip() or DEFAULT_CATEGORIES_TEXT)
+    try:
+        uploaded_categories = _categories_from_uploaded_csv()
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    raw_categories = uploaded_categories or request.form.get("categories", "").strip() or DEFAULT_CATEGORIES_TEXT
+    categories = normalize_categories_text(raw_categories)
     context = request.form.get("context", "").strip()
     model = request.form.get("model", "").strip() or OLLAMA_MODEL
     force = request.form.get("force") in {"on", "true", "1", "yes"}
@@ -989,7 +1022,7 @@ def export_scan(scan_id: int):
             for row in conn.execute(
                 """
                 SELECT file_name, file_type, folder_location, last_modified_date,
-                       creation_date, size_mb, file_hash
+                       size_mb, file_hash
                 FROM files
                 WHERE scan_id = ?
                 ORDER BY id
@@ -1001,7 +1034,6 @@ def export_scan(scan_id: int):
                     row["file_type"],
                     row["folder_location"],
                     row["last_modified_date"],
-                    row["creation_date"],
                     f"{float(row['size_mb'] or 0):.1f}",
                     row["file_hash"],
                 ]
@@ -1017,10 +1049,10 @@ def export_scan_ai(scan_id: int):
             for row in conn.execute(
                 """
                 SELECT f.file_name, f.file_type, f.folder_location, f.last_modified_date,
-                       f.creation_date, f.size_mb, f.file_hash,
+                       f.size_mb, f.file_hash,
                        a.category, a.secondary_tags, a.confidence, a.description, a.evidence_basis,
                        a.key_people, a.key_organizations, a.date_or_event, a.why_useful_as_evidence,
-                       a.needs_human_review, a.original_category, a.status AS ai_status
+                       a.needs_human_review, a.status AS ai_status
                 FROM files f
                 LEFT JOIN ai_results a
                   ON a.scan_id = f.scan_id AND a.file_hash = f.file_hash
@@ -1034,7 +1066,6 @@ def export_scan_ai(scan_id: int):
                     row["file_type"],
                     row["folder_location"],
                     row["last_modified_date"],
-                    row["creation_date"],
                     f"{float(row['size_mb'] or 0):.1f}",
                     row["file_hash"],
                     row["category"] or "",
@@ -1047,7 +1078,6 @@ def export_scan_ai(scan_id: int):
                     row["date_or_event"] or "",
                     row["why_useful_as_evidence"] or "",
                     "true" if row["needs_human_review"] else "false",
-                    row["original_category"] or "",
                     row["ai_status"] or "not_started",
                 ]
 

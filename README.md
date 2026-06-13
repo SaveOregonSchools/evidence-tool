@@ -14,9 +14,8 @@ The scanner accepts multiple absolute folder paths and/or individual file paths,
 2. Type of file
 3. Folder location
 4. Last modified date
-5. Creation date
-6. Size (MB)
-7. Hash
+5. Size (MB)
+6. Hash
 
 The default hash is `blake2b` with a 256-bit digest because it is fast and modern. You can switch to `md5` or `sha256` in `.env`.
 
@@ -26,7 +25,8 @@ After a scan, the app submits only one representative copy of each unique hash t
 
 The screen asks for:
 
-- categories to use;
+- categories to use, with optional category definitions;
+- an optional category-definition CSV where column 1 is the category name and column 2 is the definition/description;
 - free-text investigation/project context;
 - model override, if you do not want to use `OLLAMA_MODEL` from `.env`;
 - maximum extracted characters per file;
@@ -56,10 +56,17 @@ The AI export and on-screen preview include these AI fields:
 - `AI date or event`
 - `AI why useful as evidence`
 - `AI needs human review`
-- `AI original category`
 - `AI status`
 
-The app validates `AI primary category` against the allowed category list. If the model invents or modifies a category, the app retries once with a stricter correction prompt. If the retry still does not produce a valid category, the app sets the primary category to `Unrelated or insufficient evidence`, preserves the model's invalid category in `AI original category`, and marks the row for human review.
+The app validates `AI primary category` against the allowed category list. If the model invents or modifies a category, the app retries once with a stricter correction prompt. If the retry still does not produce a valid category, the app sets the primary category to `Unrelated or insufficient evidence` and marks the row for human review. The raw invalid category is still kept internally for debugging, but it is no longer shown in the preview table or exported CSV.
+
+Category input supports either one category per line or category-definition lines like:
+
+```text
+Category Name: Category definition or description
+```
+
+You can also use the optional category-definition CSV selector in Phase 2. The first column should contain the category name and the second column should contain its definition/description.
 
 Default primary categories:
 
@@ -111,6 +118,8 @@ Image handling supports:
 - `.jpg`, `.jpeg`, `.png`, `.webp`, `.tif`, `.tiff`, `.bmp`
 
 For images, the app attempts optional local OCR with `pytesseract` if it is installed. If `EVIDENCE_AI_SEND_IMAGES=true`, the app also sends the image to Ollama as a base64 image payload when the file is under `EVIDENCE_IMAGE_MAX_BYTES`. This is most useful with a multimodal model such as `gemma4:12b`.
+
+Image prompts now tell the model to classify campaign graphics, partner-logo images, screenshots, and social cards by their visible topic/purpose rather than automatically treating them as directories. The app also applies conservative confidence caps for image-only, metadata-only, filename-only, ambiguous, or human-review rows so confidence is more useful for triage.
 
 If OCR is not available and the model cannot use the image payload, the app falls back to filename/metadata and marks the result for human review.
 
@@ -222,8 +231,8 @@ The upload form copies selected files/folders into `uploads/` and scans that sta
 
 The app has two export buttons:
 
-- **Export inventory CSV**: exactly the seven Phase 1 columns.
-- **Export inventory + AI CSV**: the seven inventory columns plus the structured AI fields listed above.
+- **Export inventory CSV**: exactly the six Phase 1 columns.
+- **Export inventory + AI CSV**: the six inventory columns plus the structured AI fields listed above.
 
 The on-screen inventory preview always shows the AI columns.
 

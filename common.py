@@ -48,7 +48,6 @@ CORE_EXPORT_HEADERS = [
     "Type of file",
     "Folder location",
     "Last modified date",
-    "Creation date",
     "Size (MB)",
     "Hash",
 ]
@@ -64,7 +63,6 @@ AI_EXPORT_HEADERS = CORE_EXPORT_HEADERS + [
     "AI date or event",
     "AI why useful as evidence",
     "AI needs human review",
-    "AI raw model category",
     "AI status",
 ]
 

@@ -9,6 +9,70 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (inQuotes) {
+      if (ch === '"' && next === '"') {
+        cell += '"';
+        i++;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        cell += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(cell);
+      cell = '';
+    } else if (ch === '\n') {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else if (ch !== '\r') {
+      cell += ch;
+    }
+  }
+  row.push(cell);
+  if (row.some(v => String(v).trim() !== '')) rows.push(row);
+  return rows;
+}
+
+function importCategoryCsv(fileInput, textarea) {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file || !textarea) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const rows = parseCsvRows(String(reader.result || ''));
+    const lines = [];
+    for (const row of rows) {
+      const name = String(row[0] || '').trim();
+      const definition = String(row[1] || '').trim();
+      if (!name) continue;
+      const lower = name.toLowerCase();
+      if (['category', 'category name', 'primary category', 'name'].includes(lower)) continue;
+      lines.push(definition ? `${name}: ${definition}` : name);
+    }
+    if (!lines.length) {
+      alert('No category rows found in that CSV. Use first column = category name, second column = definition.');
+      return;
+    }
+    textarea.value = lines.join('\n');
+    // The CSV has been imported into the saved settings textbox. Clearing the
+    // file input lets you edit the imported lines before submission.
+    fileInput.value = '';
+  };
+  reader.onerror = () => alert('Could not read the selected category CSV.');
+  reader.readAsText(file);
+}
+
 function showJobPanel() {
   document.getElementById('job-panel').classList.remove('hidden');
 }
@@ -169,6 +233,13 @@ async function submitJobForm(form, buttonText) {
   } finally {
     buttons.forEach(b => { b.disabled = false; b.textContent = b.dataset.oldText || 'Submit'; });
   }
+}
+
+
+const categoryCsvInput = document.getElementById('category-csv-input');
+const categoriesTextarea = document.getElementById('categories-textarea');
+if (categoryCsvInput && categoriesTextarea) {
+  categoryCsvInput.addEventListener('change', () => importCategoryCsv(categoryCsvInput, categoriesTextarea));
 }
 
 for (const id of ['scan-form', 'upload-form', 'ai-form']) {

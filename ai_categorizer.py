@@ -21,7 +21,7 @@ from common import (
 from ollama_client import OllamaEmptyResponseError, chat
 from text_extract import IMAGE_EXTS, extract_text
 
-PATCH_ID = "2026-06-12-category-validation-v3"
+PATCH_ID = "2026-06-13-ui-category-confidence-v1"
 
 
 # Older evidence-tool runs and some copied prompt text use labels that are
@@ -109,15 +109,69 @@ def _alias_to_default(value: str) -> str | None:
     return None
 
 
-def _allowed_categories(categories: str) -> list[str]:
+def _split_category_definition(line: str) -> tuple[str, str]:
+    """Return (category, definition) from a single line, if a definition is present."""
+    raw = str(line or "").strip()
+    raw = re.sub(r"^[-*•\u2022\s]+", "", raw).strip()
+    raw = re.sub(r"^\d+[.)]\s+", "", raw).strip()
+    raw = re.sub(r"^\[[ xX]\]\s+", "", raw).strip()
+    if not raw:
+        return "", ""
+
+    # Prefer a colon delimiter because that is the user-facing format:
+    # Category Name: Category definition
+    for sep in (":", " - ", " – ", " — "):
+        if sep in raw:
+            left, right = raw.split(sep, 1)
+            category = _norm_category_text(left)
+            definition = str(right or "").strip()
+            if category and definition:
+                canonical = _alias_to_default(category) or category
+                return canonical, definition
+
+    cleaned = _norm_category_text(raw)
+    return cleaned, ""
+
+
+def _is_prompt_or_heading_line(value: str) -> bool:
+    lower = str(value or "").strip().casefold().rstrip(":")
+    if not lower:
+        return True
+    if lower in {
+        "allowed primary categories",
+        "recommended primary categories",
+        "category definitions",
+        "classification precedence rules",
+        "task",
+        "important rules",
+        "return exactly this json structure",
+    }:
+        return True
+    return lower.startswith((
+        "use for ",
+        "do not use ",
+        "choose exactly ",
+        "return ",
+        "task:",
+        "important rules",
+        "classification precedence",
+        "project context",
+    ))
+
+
+def _category_specs(categories: str) -> tuple[list[str], dict[str, str]]:
+    """Parse user category input into allowed names plus optional definitions.
+
+    Supported formats:
+    - one category per line
+    - Category Name: definition
+    - CSV upload converted by app.py into Category Name: definition lines
+    - older category aliases, which are normalized to the current default labels
+    """
     raw = categories or ""
     if not raw.strip():
-        return list(DEFAULT_PRIMARY_CATEGORIES)
+        return list(DEFAULT_PRIMARY_CATEGORIES), {}
 
-    # If the user pasted the recommended prompt, category definitions, or a
-    # markdown section instead of just the category names, switch back to the
-    # clean default category list. That is safer than treating definition prose
-    # as category names and then rejecting every useful model category.
     default_hits = []
     for cat in DEFAULT_PRIMARY_CATEGORIES:
         if re.search(rf"(^|[\n\r\-•*\s]){re.escape(cat)}\s*(:|$|[\n\r])", raw, flags=re.IGNORECASE):
@@ -129,34 +183,65 @@ def _allowed_categories(categories: str) -> list[str]:
         or "classification precedence" in raw.casefold()
         or "choose exactly one primary" in raw.casefold()
     )
-    if defaultish_markers and len(default_hits) >= 3:
-        return list(DEFAULT_PRIMARY_CATEGORIES)
-    if len(default_hits) >= 8:
-        return list(DEFAULT_PRIMARY_CATEGORIES)
+
+    # When the pasted text looks like the full recommended prompt, keep the clean
+    # default category set. We still harvest one-line definitions if the user has
+    # provided them in Category: definition form.
+    force_defaults = (defaultish_markers and len(default_hits) >= 3) or len(default_hits) >= 8
 
     items: list[str] = []
-    for part in re.split(r"[\n,;]+", raw):
-        cleaned = _norm_category_text(part)
-        if not cleaned:
-            continue
-        canonical_default = _alias_to_default(cleaned)
-        cleaned = canonical_default or cleaned
-        lower = cleaned.casefold()
-        # Skip obvious copied prompt prose.
-        if lower in {"allowed primary categories", "recommended primary categories", "category definitions"}:
-            continue
-        if lower.startswith(("use for ", "do not use ", "choose exactly ", "classification precedence", "return ", "task:")):
-            continue
-        if cleaned not in items:
-            items.append(cleaned)
+    definitions: dict[str, str] = {}
 
-    return items or list(DEFAULT_PRIMARY_CATEGORIES)
+    # Definition lines may contain commas and semicolons, so treat newlines as
+    # primary delimiters. Only split comma/semicolon lists when a line has no
+    # category-definition delimiter.
+    raw_lines = [line.strip() for line in raw.replace("\r", "\n").split("\n")]
+    pieces: list[str] = []
+    for line in raw_lines:
+        if not line.strip():
+            continue
+        stripped = line.strip()
+        has_definition_delimiter = any(sep in stripped for sep in (":", " - ", " – ", " — "))
+        if has_definition_delimiter:
+            pieces.append(stripped)
+        else:
+            pieces.extend(part.strip() for part in re.split(r"[,;]+", stripped) if part.strip())
+
+    for part in pieces:
+        category, definition = _split_category_definition(part)
+        if not category or _is_prompt_or_heading_line(category):
+            continue
+        canonical_default = _alias_to_default(category)
+        category = canonical_default or category
+        if category not in items:
+            items.append(category)
+        if definition:
+            definitions[category] = definition
+
+    if force_defaults:
+        # Use default categories in their canonical order. Keep any user-supplied
+        # definitions that match those categories.
+        allowed = list(DEFAULT_PRIMARY_CATEGORIES)
+        return allowed, {cat: definitions[cat] for cat in allowed if cat in definitions}
+
+    return (items or list(DEFAULT_PRIMARY_CATEGORIES)), definitions
+
+
+def _allowed_categories(categories: str) -> list[str]:
+    return _category_specs(categories)[0]
 
 
 def normalize_categories_text(categories: str) -> str:
-    """Return the cleaned category list that the app should save/use for a job."""
-    return "\n".join(_allowed_categories(categories))
-
+    """Return the cleaned category list/spec that the app should save/use for a job."""
+    allowed, definitions = _category_specs(categories)
+    lines = []
+    for item in allowed:
+        definition = definitions.get(item, "").strip()
+        if definition:
+            lines.append(f"{item}: {definition}")
+        else:
+            lines.append(item)
+    return "\n".join(lines)
 
 def canonicalize_category(value: str, categories: str = "") -> str | None:
     """Public helper used by repair scripts and tests."""
@@ -416,12 +501,28 @@ def _using_default_categories(allowed_categories: list[str]) -> bool:
     return allowed_categories == list(DEFAULT_PRIMARY_CATEGORIES)
 
 
-def _category_guidance_block(allowed_categories: list[str]) -> str:
+def _category_guidance_block(allowed_categories: list[str], category_definitions: dict[str, str] | None = None) -> str:
+    category_definitions = category_definitions or {}
+    if category_definitions:
+        lines = ["Custom category definitions:"]
+        for category in allowed_categories:
+            definition = str(category_definitions.get(category, "")).strip()
+            if definition:
+                lines.append(f"\n{category}:\n{definition}")
+        lines.append(
+            "\nUse the dominant purpose of the file to choose exactly one primary_category from the allowed list. "
+            "Do not invent or modify category names."
+        )
+        if _using_default_categories(allowed_categories):
+            lines.append("\n" + CATEGORY_PRECEDENCE_RULES_TEXT)
+        return "\n".join(lines)
+
     if _using_default_categories(allowed_categories):
         return f"{CATEGORY_DEFINITIONS_TEXT}\n\n{CATEGORY_PRECEDENCE_RULES_TEXT}"
     return (
         "Custom category list supplied by the user. Use the dominant purpose of the file to choose exactly one "
-        "primary_category from that supplied list. Do not invent or modify category names."
+        "primary_category from that supplied list. Do not invent or modify category names. If the categories are "
+        "not mutually exclusive, choose the one that best reflects the file's primary purpose and evidentiary use."
     )
 
 
@@ -435,6 +536,7 @@ def build_messages(
     categories: str,
     context: str,
     allowed_categories: list[str],
+    category_definitions: dict[str, str] | None = None,
     is_image: bool = False,
     image_attached: bool = False,
     image_attach_error: str = "",
@@ -453,6 +555,8 @@ Rules:
 - If the file appears unrelated to the project context, say that briefly and still summarize what the file appears to contain.
 - Do not invent people, organizations, dates, claims, or legal significance that are not supported by the provided material.
 - Do not make legal conclusions.
+- Calibrate confidence carefully. Use 0.95+ only when the category and summary are directly supported by strong extracted text or visible image text; use 0.75-0.94 for solid but partial support; use 0.50-0.74 for plausible inference; use below 0.50 when relying mainly on filename or metadata.
+- For metadata-only or filename-only files, do not return confidence above 0.55. For image files, do not return confidence above 0.85 unless visible text clearly identifies the topic and purpose.
 - Final answer only: no reasoning trace, no chain-of-thought, no hidden reasoning, no markdown, no code fence, no XML tags, no introductory prose.
 - Return compact valid JSON only.
 - Begin the answer with {{ and end it with }}.
@@ -462,7 +566,10 @@ Rules:
     if is_image:
         image_instruction = f"""
 Image-specific instruction:
-This file is an image. Use visible text, logos, layout, and filename to summarize it. If visible text is available, do not say the description is based on metadata only. If no visible text is available and the image is not attached or cannot be interpreted, say the description is based on metadata only or filename only and mark needs_human_review as true.
+This file is an image. Use visible text, logos, layout, people shown only when identifiable from filename/visible text, and filename to summarize it. If visible text or logos are available, do not say the description is based on metadata only.
+For images with partner logos, coalition badges, social-media cards, screenshots, or campaign graphics, classify by the apparent campaign/topic/purpose rather than defaulting to People / organization directory. Use People / organization directory only when the image is mainly a broad roster, logo sheet, contact/directory artifact, or person/organization reference with no clearer topical campaign purpose.
+If the visible text, filename, or layout suggests vouchers, privatization, education funding, book bans, anti-CRT/anti-DEI attacks, public education defense, or a campaign such as Truth in Education Funding, prefer Public education defense / voucher-privatization response when that is an allowed category.
+If no visible text is available and the image is not attached or cannot be interpreted, say the description is based on metadata only or filename only, keep confidence low, and mark needs_human_review as true.
 Image attached to Ollama request: {str(bool(image_attached)).lower()}
 Image attach error, if any: {image_attach_error or '[none]'}
 """.strip()
@@ -473,7 +580,7 @@ Project context, for background only:
 
 {_categories_block(allowed_categories)}
 
-{_category_guidance_block(allowed_categories)}
+{_category_guidance_block(allowed_categories, category_definitions)}
 
 File name:
 {file_metadata.get('file_name') or ''}
@@ -516,6 +623,7 @@ Important rules:
 - Do not speculate beyond available evidence.
 - If little or no text is available, say “Based on metadata only...” or “Based on filename only...” and mark needs_human_review as true.
 - If visible image text is available, do not say the description is based on metadata only.
+- Calibrate confidence; avoid 1.00 unless the file content makes the category unmistakable. Use lower confidence and needs_human_review=true for metadata-only, filename-only, ambiguous, or image-only results.
 - Avoid loaded, accusatory, or conclusory language.
 
 Return the JSON object only now. /no_think
@@ -607,6 +715,82 @@ def _guess_evidence_basis(*, is_image: bool, image_attached: bool, extracted_tex
     return "metadata only"
 
 
+def _calibrate_confidence(
+    confidence: float | None,
+    *,
+    basis: str,
+    category_valid: bool,
+    needs_review: bool,
+    is_image: bool,
+    image_attached: bool,
+    extracted_text: str,
+    ocr_text: str,
+    extraction_status: str,
+    primary_category: str,
+    parse_status: str,
+) -> float:
+    """Apply conservative caps so model confidence is useful for triage.
+
+    Models tend to overuse 1.00. This tool treats confidence as a practical
+    review signal, not a mathematical probability, so it caps scores when the
+    evidence basis is weaker or the result needs review.
+    """
+    if confidence is None:
+        if not category_valid:
+            confidence = 0.30
+        elif basis in {"filename only"}:
+            confidence = 0.35
+        elif basis in {"metadata only"}:
+            confidence = 0.45
+        elif basis == "visible image text":
+            confidence = 0.75
+        elif basis == "mixed":
+            confidence = 0.82
+        else:
+            confidence = 0.80
+
+    conf = max(0.0, min(1.0, float(confidence)))
+    caps: list[float] = [0.97]
+
+    if not category_valid:
+        caps.append(0.35)
+    if parse_status in {"parsed_as_text", "invalid_category_fallback"}:
+        caps.append(0.45)
+    elif parse_status in {"parsed_fields"}:
+        caps.append(0.90)
+
+    if basis == "filename only":
+        caps.append(0.50)
+    elif basis == "metadata only":
+        caps.append(0.55)
+    elif basis == "visible image text":
+        caps.append(0.85)
+    elif basis == "mixed":
+        caps.append(0.90)
+
+    if is_image:
+        if not (ocr_text.strip() or image_attached):
+            caps.append(0.50)
+        else:
+            caps.append(0.85)
+
+    if extraction_status in {"extract_error_metadata_only", "unsupported_metadata_only"}:
+        caps.append(0.60)
+    if extraction_status in {"image_ocr_unavailable", "image_ocr_error", "image_ocr_no_text"} and not image_attached:
+        caps.append(0.50)
+
+    if not extracted_text.strip() and not ocr_text.strip() and not image_attached:
+        caps.append(0.55)
+
+    if primary_category == "Unrelated or insufficient evidence":
+        caps.append(0.70)
+
+    if needs_review:
+        caps.append(0.65)
+
+    return round(min(conf, *caps), 2)
+
+
 def _postprocess_fields(
     parsed: dict[str, Any],
     *,
@@ -624,20 +808,11 @@ def _postprocess_fields(
         basis = _guess_evidence_basis(is_image=is_image, image_attached=image_attached, extracted_text=extracted_text, ocr_text=ocr_text)
     parsed["evidence_basis"] = basis
 
-    conf = parsed.get("confidence")
-    if conf is None:
-        # Conservative defaults when a model omits confidence.
-        if basis in {"metadata only", "filename only"}:
-            conf = 0.35
-        elif category_valid:
-            conf = 0.75
-        else:
-            conf = 0.25
-    parsed["confidence"] = max(0.0, min(1.0, float(conf)))
-
     needs_review = bool(parsed.get("needs_human_review"))
-    if parsed["confidence"] < 0.5:
-        needs_review = True
+    conf = parsed.get("confidence")
+
+    # Apply review rules before the final confidence cap so review-triggering
+    # conditions cap high model scores.
     if basis in {"metadata only", "filename only"}:
         needs_review = True
     if is_image and not (ocr_text.strip() or image_attached):
@@ -645,6 +820,23 @@ def _postprocess_fields(
     if not category_valid:
         needs_review = True
     if extraction_status in {"extract_error_metadata_only", "unsupported_metadata_only", "image_ocr_unavailable", "image_ocr_error", "image_ocr_no_text"} and not image_attached:
+        needs_review = True
+
+    parsed["confidence"] = _calibrate_confidence(
+        conf,
+        basis=basis,
+        category_valid=category_valid,
+        needs_review=needs_review,
+        is_image=is_image,
+        image_attached=image_attached,
+        extracted_text=extracted_text,
+        ocr_text=ocr_text,
+        extraction_status=extraction_status,
+        primary_category=str(parsed.get("primary_category") or ""),
+        parse_status=str(parsed.get("status") or ""),
+    )
+
+    if parsed["confidence"] < 0.55:
         needs_review = True
     parsed["needs_human_review"] = needs_review
     parsed["category_valid"] = 1 if category_valid else 0
@@ -711,7 +903,7 @@ def categorize_file(
         }
     )
 
-    allowed_categories = _allowed_categories(categories)
+    allowed_categories, category_definitions = _category_specs(categories)
     schema = _schema_for_categories(allowed_categories)
     messages = build_messages(
         file_metadata=metadata,
@@ -722,6 +914,7 @@ def categorize_file(
         categories=categories,
         context=context,
         allowed_categories=allowed_categories,
+        category_definitions=category_definitions,
         is_image=is_image,
         image_attached=image_attached,
         image_attach_error=image_attach_error,
