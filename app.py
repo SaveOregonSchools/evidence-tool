@@ -14,7 +14,7 @@ from typing import Any
 from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
 from werkzeug.utils import secure_filename
 
-from ai_categorizer import categorize_file
+from ai_categorizer import categorize_file, normalize_categories_text
 from common import (
     AI_ERROR_EXPORT_HEADERS,
     AI_EXPORT_HEADERS,
@@ -33,7 +33,7 @@ from common import (
 )
 from evidence_scanner import parse_paths, scan_files
 
-APP_PATCH_ID = "2026-06-12-evidence-fields-v1"
+APP_PATCH_ID = "2026-06-12-category-validation-v3"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20GB; local-only app, override in deployment if needed.
@@ -46,7 +46,7 @@ JOBS_LOCK = threading.Lock()
 AI_QUEUE: Queue[int] = Queue()
 AI_WORKER_LOCK = threading.Lock()
 AI_WORKER_STARTED = False
-AI_SUCCESS_STATUSES = {"ok", "parsed_fields", "category_retry_ok", "invalid_category_fallback"}
+AI_SUCCESS_STATUSES = {"ok", "parsed_fields", "category_retry_ok", "category_normalized", "category_repaired"}
 AI_TERMINAL_STATUSES = {"done", "failed", "cancelled", "interrupted"}
 
 
@@ -827,7 +827,7 @@ def start_ai():
     scan_id = request.form.get("scan_id", type=int)
     if not scan_id:
         return jsonify({"ok": False, "error": "No scan selected."}), 400
-    categories = request.form.get("categories", "").strip() or DEFAULT_CATEGORIES_TEXT
+    categories = normalize_categories_text(request.form.get("categories", "").strip() or DEFAULT_CATEGORIES_TEXT)
     context = request.form.get("context", "").strip()
     model = request.form.get("model", "").strip() or OLLAMA_MODEL
     force = request.form.get("force") in {"on", "true", "1", "yes"}

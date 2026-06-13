@@ -64,7 +64,7 @@ AI_EXPORT_HEADERS = CORE_EXPORT_HEADERS + [
     "AI date or event",
     "AI why useful as evidence",
     "AI needs human review",
-    "AI original category",
+    "AI raw model category",
     "AI status",
 ]
 

@@ -21,12 +21,146 @@ from common import (
 from ollama_client import OllamaEmptyResponseError, chat
 from text_extract import IMAGE_EXTS, extract_text
 
-PATCH_ID = "2026-06-12-evidence-fields-v1"
+PATCH_ID = "2026-06-12-category-validation-v3"
+
+
+# Older evidence-tool runs and some copied prompt text use labels that are
+# close to, but not exactly, the current recommended primary categories.
+# Normalize those labels before validating model output so that a useful
+# category is not thrown away merely because the category box contained old
+# labels, bullets, definitions, trailing colons, or copied markdown.
+CATEGORY_ALIASES: dict[str, str] = {
+    "Network convening / assembly materials": "Network assembly / convening materials",
+    "Network assembly / convening": "Network assembly / convening materials",
+    "Network assembly materials": "Network assembly / convening materials",
+    "Participant or member lists": "Participant / attendee lists",
+    "Participant lists": "Participant / attendee lists",
+    "Attendee lists": "Participant / attendee lists",
+    "Participant list": "Participant / attendee lists",
+    "People / organization list": "People / organization directory",
+    "People / organizations directory": "People / organization directory",
+    "People / org directory": "People / organization directory",
+    "People / organization lists": "People / organization directory",
+    "Strategy / governance / planning": "Network strategy / governance / regeneration",
+    "Network strategy / governance / planning": "Network strategy / governance / regeneration",
+    "Strategy / governance / regeneration": "Network strategy / governance / regeneration",
+    "Strategy regeneration": "Network strategy / governance / regeneration",
+    "Workgroup / priority-area planning": "Work group / priority-area planning",
+    "Work group planning": "Work group / priority-area planning",
+    "Priority-area planning": "Work group / priority-area planning",
+    "Policy framework or policy agenda": "Policy framework / policy agenda",
+    "Policy framework and policy agenda": "Policy framework / policy agenda",
+    "Shared Story / narrative / communications": "Shared Story / narrative / communications strategy",
+    "Shared Story / narrative strategy": "Shared Story / narrative / communications strategy",
+    "Narrative / communications strategy": "Shared Story / narrative / communications strategy",
+    "Education resourcing": "Education resourcing / school funding",
+    "School funding": "Education resourcing / school funding",
+    "Teacher workforce": "Teacher / educator workforce",
+    "Educator workforce": "Teacher / educator workforce",
+    "Place-based strategy": "Place-based / Key Places strategy",
+    "Key Places strategy": "Place-based / Key Places strategy",
+    "Administrative / run-of-show / agenda / notes": "Administrative logistics / internal run-of-show",
+    "Administrative / run-of-show": "Administrative logistics / internal run-of-show",
+    "Administrative logistics": "Administrative logistics / internal run-of-show",
+    "Run-of-show / agenda / notes": "Administrative logistics / internal run-of-show",
+    "General announcement / member update": "General network announcement / member update",
+    "General network announcement": "General network announcement / member update",
+    "Member update": "General network announcement / member update",
+    "Other / Unclear": "Unrelated or insufficient evidence",
+    "Other": "Unrelated or insufficient evidence",
+    "Unclear": "Unrelated or insufficient evidence",
+    "Miscellaneous": "Unrelated or insufficient evidence",
+}
+
+
+def _strip_wrapping_punctuation(value: str) -> str:
+    chars = "` \t\r\n\\\"'.,;:-–—“”‘’"
+    return str(value or "").strip().strip(chars)
+
+
+def _norm_category_text(value: str) -> str:
+    s = str(value or "").strip()
+    # Markdown bullets, numbering, and checkboxes.
+    s = re.sub(r"^[-*•\u2022\s]+", "", s).strip()
+    s = re.sub(r"^\d+[.)]\s+", "", s).strip()
+    s = re.sub(r"^\[[ xX]\]\s+", "", s).strip()
+    s = _strip_wrapping_punctuation(s)
+
+    # If a pasted definition line starts with a category label, keep the label.
+    # Example: "Community schools: Use for documents primarily about..."
+    for cat in DEFAULT_PRIMARY_CATEGORIES:
+        if re.match(rf"^{re.escape(cat)}\s*[:\-–—]", s, flags=re.IGNORECASE):
+            return cat
+    for alias, canonical in CATEGORY_ALIASES.items():
+        if re.match(rf"^{re.escape(alias)}\s*[:\-–—]", s, flags=re.IGNORECASE):
+            return canonical
+    return _strip_wrapping_punctuation(s)
+
+
+def _alias_to_default(value: str) -> str | None:
+    candidate = _norm_category_text(value)
+    folded = re.sub(r"\s+", " ", candidate).casefold()
+    for cat in DEFAULT_PRIMARY_CATEGORIES:
+        if re.sub(r"\s+", " ", cat).casefold() == folded:
+            return cat
+    for alias, canonical in CATEGORY_ALIASES.items():
+        if re.sub(r"\s+", " ", alias).casefold() == folded:
+            return canonical
+    return None
 
 
 def _allowed_categories(categories: str) -> list[str]:
-    items = [item.strip(" -\t") for item in re.split(r"[\n,;]+", categories or "") if item.strip(" -\t")]
+    raw = categories or ""
+    if not raw.strip():
+        return list(DEFAULT_PRIMARY_CATEGORIES)
+
+    # If the user pasted the recommended prompt, category definitions, or a
+    # markdown section instead of just the category names, switch back to the
+    # clean default category list. That is safer than treating definition prose
+    # as category names and then rejecting every useful model category.
+    default_hits = []
+    for cat in DEFAULT_PRIMARY_CATEGORIES:
+        if re.search(rf"(^|[\n\r\-•*\s]){re.escape(cat)}\s*(:|$|[\n\r])", raw, flags=re.IGNORECASE):
+            default_hits.append(cat)
+    defaultish_markers = (
+        "allowed primary categor" in raw.casefold()
+        or "recommended primary categor" in raw.casefold()
+        or "category definitions" in raw.casefold()
+        or "classification precedence" in raw.casefold()
+        or "choose exactly one primary" in raw.casefold()
+    )
+    if defaultish_markers and len(default_hits) >= 3:
+        return list(DEFAULT_PRIMARY_CATEGORIES)
+    if len(default_hits) >= 8:
+        return list(DEFAULT_PRIMARY_CATEGORIES)
+
+    items: list[str] = []
+    for part in re.split(r"[\n,;]+", raw):
+        cleaned = _norm_category_text(part)
+        if not cleaned:
+            continue
+        canonical_default = _alias_to_default(cleaned)
+        cleaned = canonical_default or cleaned
+        lower = cleaned.casefold()
+        # Skip obvious copied prompt prose.
+        if lower in {"allowed primary categories", "recommended primary categories", "category definitions"}:
+            continue
+        if lower.startswith(("use for ", "do not use ", "choose exactly ", "classification precedence", "return ", "task:")):
+            continue
+        if cleaned not in items:
+            items.append(cleaned)
+
     return items or list(DEFAULT_PRIMARY_CATEGORIES)
+
+
+def normalize_categories_text(categories: str) -> str:
+    """Return the cleaned category list that the app should save/use for a job."""
+    return "\n".join(_allowed_categories(categories))
+
+
+def canonicalize_category(value: str, categories: str = "") -> str | None:
+    """Public helper used by repair scripts and tests."""
+    return _canonical_category(value, _allowed_categories(categories))
 
 
 def _schema_for_categories(allowed_categories: list[str]) -> dict[str, Any]:
@@ -421,13 +555,29 @@ def _chat_with_fallbacks(messages: list[dict[str, Any]], *, model: str | None, s
 
 
 def _canonical_category(value: str, allowed_categories: list[str]) -> str | None:
-    candidate = (value or "").strip()
+    candidate = _norm_category_text(value)
+    if not candidate:
+        return None
+
+    # First validate against the job's allowed categories.
     if candidate in allowed_categories:
         return candidate
     folded = re.sub(r"\s+", " ", candidate).casefold()
     for allowed in allowed_categories:
-        if re.sub(r"\s+", " ", allowed).casefold() == folded:
-            return allowed
+        allowed_clean = _norm_category_text(allowed)
+        if re.sub(r"\s+", " ", allowed_clean).casefold() == folded:
+            return allowed_clean
+
+    # Then map older labels / near matches to equivalent default categories.
+    default_candidate = _alias_to_default(candidate)
+    if default_candidate:
+        for allowed in allowed_categories:
+            allowed_default = _alias_to_default(allowed) or _norm_category_text(allowed)
+            if allowed_default == default_candidate:
+                return default_candidate if default_candidate in DEFAULT_PRIMARY_CATEGORIES else _norm_category_text(allowed)
+        if default_candidate in DEFAULT_PRIMARY_CATEGORIES and set(DEFAULT_PRIMARY_CATEGORIES).issubset(set(allowed_categories)):
+            return default_candidate
+
     return None
 
 
@@ -588,6 +738,8 @@ def categorize_file(
     retry_raw = ""
     if canonical:
         parsed["primary_category"] = canonical
+        if canonical != original_category and parsed.get("status") == "ok":
+            parsed["status"] = "category_normalized"
     else:
         retry_messages = _invalid_category_retry_messages(
             messages,
